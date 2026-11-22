@@ -1,0 +1,99 @@
+// Frame rate policy for AC4 (GAME_NOTES "Frame pacing"): the game's simulation advances by
+// measured time, so gameplay runs at the configured target (--fps / settings.ini), but some menu
+// fades count frames (twice as fast at 120 fps) and the system movie player fails above 60 Hz:
+// outside gameplay the emulated vblank runs at up to 60 Hz. Gameplay is the AC's fire control
+// thread "FcsManager" alive inside a sortie scene (threads named *SortieScene: Ac4SortieScene for
+// missions; the tutorial's, AC TEST's and the arena's own): the hub runs an FcsManager of its own,
+// and a sortie scene starts already at the briefing (run 20261015-144257: hub FcsManager 42-54 s,
+// Ac4SortieScene from 54 s, the mission's FcsManager 86-172 s).
+#include "runtime/game/frame_policy.h"
+
+#include <atomic>
+#include <map>
+#include <mutex>
+
+#include "runtime/gpu/display.h"
+
+namespace rt::game {
+namespace {
+std::mutex g_mu;
+int g_fcs = 0, g_sorties = 0;
+std::atomic<bool> g_gameplay{false};
+// The system movie player's control thread (cellSail, one per playing movie: the opening, the
+// title's background, briefings, chapter movies, the staff roll).
+constexpr const char* kMoviePlayer = "_libsail-control";
+int g_movies = 0;
+// Live threads whose name ends in "Scene" (each game scene runs one: research\28 uses them to tell
+// the hub at rest from the garage, shop, ACSIS ... opened from it).
+std::map<std::string, int> g_scenes;
+
+bool is_scene(const std::string& n) { return n.size() > 5 && n.compare(n.size() - 5, 5, "Scene") == 0; }
+std::atomic<bool> g_movie{false};
+
+bool is_sortie(const std::string& name) {
+  constexpr const char* kSuffix = "SortieScene";
+  return name.size() >= 11 && name.compare(name.size() - 11, 11, kSuffix) == 0;
+}
+
+// Called with g_mu held after a count changed.
+void update() {
+  bool now = g_fcs > 0 && g_sorties > 0;
+  if (now == g_gameplay.load(std::memory_order_relaxed)) return;
+  g_gameplay = now;
+  if (now) gpu::display::gameplay_started();
+  else gpu::display::gameplay_stopped();
+}
+}  // namespace
+
+std::string live_scenes() {
+  std::lock_guard lk(g_mu);
+  std::string s;
+  for (auto& kv : g_scenes) {
+    if (!s.empty()) s += ',';
+    s += kv.first;
+  }
+  return s;
+}
+
+bool scene_alive(const std::string& name) {
+  std::lock_guard lk(g_mu);
+  return g_scenes.count(name) != 0;
+}
+
+bool mission_running() { return g_gameplay.load(std::memory_order_relaxed); }
+bool movie_playing() { return g_movie.load(std::memory_order_relaxed); }
+
+void thread_started(const std::string& name) {
+  if (is_scene(name)) {
+    std::lock_guard lk(g_mu);
+    ++g_scenes[name];
+  }
+  if (name == kMoviePlayer) {
+    std::lock_guard lk(g_mu);
+    g_movie = ++g_movies > 0;
+  } else if (name == "FcsManager" || is_sortie(name)) {
+    std::lock_guard lk(g_mu);
+    (name == "FcsManager" ? g_fcs : g_sorties)++;
+    update();
+  }
+}
+
+void thread_exited(const std::string& name) {
+  if (is_scene(name)) {
+    std::lock_guard lk(g_mu);
+    auto it = g_scenes.find(name);
+    if (it != g_scenes.end() && --it->second <= 0) g_scenes.erase(it);
+  }
+  if (name == kMoviePlayer) {
+    std::lock_guard lk(g_mu);
+    if (g_movies > 0) --g_movies;
+    g_movie = g_movies > 0;
+  } else if (name == "FcsManager" || is_sortie(name)) {
+    std::lock_guard lk(g_mu);
+    int& n = name == "FcsManager" ? g_fcs : g_sorties;
+    if (n > 0) --n;
+    update();
+  }
+}
+
+}  // namespace rt::game

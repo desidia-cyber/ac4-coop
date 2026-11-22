@@ -1,0 +1,87 @@
+# Guest functions routed through runtime hooks (implementations in this directory).
+# Addresses are in BLUS30027 (Armored Core 4, disc 01.01).
+# Read by ac4-recomp emit --hooks; a hooked f_<addr> calls ppu::hook_<name>(ctx, original).
+# Format: <address> <name>   # comment
+0x00951f94 pad_update             # pad object update: cellPadGetData, sticks normalized at +1172 (port at +384)
+0x005ead28 pad_update_b           # second pad class: port at +736, sticks normalized at +1524
+0x00b6b148 view_turn_set          # AC view slot 6: turn command setter (r3 view, f1); player call returns to 0xb52708
+0x00b6acf4 view_turn_set_b        # the tutorial's AC view (vtable 0x10148768) slot 6: the same setter, also marking turn input for its steps
+0x00b67cc8 input_turn_set         # the plain input class (vtable 0x1013f400) slot 6: the player's turn command in the SIMULATOR (VS scenes)
+0x00b67970 view_pitch_set         # AC view slot 9: look pitch thunk to slot 8 (0xb6b2a4); player calls return to 0xb52800 / 0xb52c30
+0x00a372e8 look_update            # an AC's look control: turn (0xa36c6c; +4 the camera's yaw against the body), pitch command, pitch integrator (0xa36684, state +48)
+0x009ac8d4 view_matrix            # an AC's view matrix (r3 out 4x4, r4 the AC; body transform x look control rotation, at the head): the mouse camera's turn for the camera's callers
+0x001406b8 present                # frame pacer: flip buffer +16; mode 1 (+4) repeats the flip above the target rate (+32)
+0x00d88e78 setjmp           # guest setjmp: its call sites may return twice (recompiler; runtime/guest_setjmp.cpp)
+0x00d88f9c longjmp          # guest longjmp: back to the live setjmp call (Lua script errors; runtime/guest_setjmp.cpp)
+0x002b12dc lua_throw        # Lua 5.0 luaD_throw(L, status): logs script errors (game/lua_hooks.cpp)
+0x004ddddc name_compare     # case-insensitive name compare (stack copies, lowercase, strcmp): native (game/native_hooks.cpp)
+0x0054a648 pair_find        # pair lookup in a table of 8-byte entries, (A,B) -> 2, (B,A) -> 1: native (game/native_hooks.cpp)
+0x0095c848 arena_alloc      # draw-data arena allocator (0x30000 16-byte units, counter at +0x300000, unchecked): high-water/overflow log (game/frame_hooks.cpp)
+0x008fdbe8 heap_alloc       # game heap allocation (virtual): patched draw-arena objects (from 0x8ecbf8) get port memory (game/frame_hooks.cpp)
+0x008fdbac heap_free        # game heap free: never frees those port-owned draw-arena objects (game/frame_hooks.cpp)
+0x008ebfd8 layer_add        # draw-list layer append (r3 manager): counts entries dropped by full layers (game/frame_hooks.cpp)
+0x008eb628 layer_add_direct # draw-list layer append (r3 layer header): same diagnostics
+0x0091af7c menu_frame       # every frame: pads to key messages {384, code} via the framework vtable +20 (menu_mouse.cpp)
+0x005de750 menu_dispatch    # dialog manager: a key message to its top dialog when it takes input (stops the menu mouse probe; menu_mouse.cpp)
+0x005de614 menu_dispatch_v  # the same with the message by value (SYSTEM and others: scene +1228 managers; menu_mouse.cpp)
+0x00640e98 menu_object      # a scene menu object: a key straight to one of its two dialogs (+272/+276 by +284; menu_mouse.cpp)
+0x006a19a0 menu_dialog_key  # a dialog's base key handler (to its focus object +36): any other route ends here (stops the probe; menu_mouse.cpp)
+0x009fc210 ac_turn_input      # an AC's turn input, every frame (r3 controller, r4 input): the player's turn object and AC body for the mouse camera (input_hooks.cpp)
+0x009fc364 ac_turn_input_b    # the same while the turn command is not zero
+0x00b4cce0 unit_ai             # the per-unit command loop (r3 unit): second-player claim/freeze (input_hooks.cpp)
+0x00b54478 operator_update     # the pad operator's per-frame update (r3 operator, r4 AC input, r5 dt): creation survey (AC4_TRACE_CREATE=1; input_hooks.cpp, create_hooks.cpp)
+0x00b54dd0 operator_update_a   # the operator update variants that call 0xb54478: which one a scene drives (AC4_TRACE_CREATE=1)
+0x00b54e94 operator_update_b   #   (same survey)
+0x00b54f24 operator_update_c   #   (same survey)
+0x00b54fa0 operator_update_d   #   (same survey)
+0x00b50e14 operator_ctor       # operator ctor variant (this, r4 = input, r5 = key source): this+0 vtable 0x10147998, +4 = 1, +8 = r4, +12 = 0 (AC4_TRACE_CREATE=1; input_hooks.cpp)
+0x00b51058 operator_ctor_b     #   (twin of 0xb50e14)
+0x00b5129c player_ctor_e       # operator ctor variant: (this, r4 = PAD PORT, r5 = AC input object)
+0x00b514e8 player_ctor_f       #   (twin of 0xb5129c)
+0x00b5193c player_ctor_a       # the class that embeds the operator at +116: operator+12 = r6
+0x00b519ac player_ctor_b       #   (twin of 0xb5193c)
+0x00b51a1c player_ctor_c       #   the same with the port left 0
+0x00b51a78 player_ctor_d       #   (twin of 0xb51a1c)
+0x007dcfcc acctl_ctor_a        # candidates for the AC controller's constructor (vtable 0x10140e28, cell 0x00f04588)
+0x00ba46b0 acctl_ctor_d        #   (same)
+0x00738318 create_vs_player    # VS: the per-player creator (called once per player from 0x80c9c8; operator port = its r4) (AC4_TRACE_CREATE=1)
+0x0080c9c8 create_vs_loop      # VS: the function that calls create_vs_player (from 0x80f09c)
+0x0080f09c create_vs_entry     # VS: VsSortieScene vtable slot 22, called from VsSortieScene::Init at 0x812c20
+0x00b0b8f0 create_ms_player    # mission: the single-player creator (calls the controller ctor 0xb5193c at 0xb0b9a0)
+0x00740838 ac_scene_init       # Ac4SortieScene::Init (r3 the scene, r2 the scene's TOC; from MissionSortieScene::Init with lr 0x007ce638): remembered for the second build (AC4_COOP=1; coop_build.cpp)
+0x007405d0 ac_scene_cleanup    # Ac4SortieScene::Cleanup (r3 the scene): tears down builder2 alongside builder1 without double-freeing the shared container (AC4_COOP=1; coop_build.cpp)
+0x00b0d354 ac_build            # the builder's Build (r3 the builder; called from 0x00740a84 through the TOC thunk 0x00737d48): builds a second player after the game's own (AC4_COOP=1; coop_build.cpp)
+0x00b0b77c ac_container        # builder vtable+32 (opd 0x00ea0318): allocates the 4528-byte container stored at builder+64; skipped in the second build, which gets builder1's container (AC4_COOP=1; coop_build.cpp)
+0x00b12770 ac_container_final  # the Build's container finalise (lr 0x00b0d6c4): skippable by AC4_COOP_SKIP (E8 diagnosis)
+0x00b0bf04 ac_build_slot10     # the Build's vtable+40 step (lr 0x00b0d6f4): skippable by AC4_COOP_SKIP
+0x00b0b36c ac_build_slot9      # the Build's vtable+36 step (lr 0x00b0d778): skippable by AC4_COOP_SKIP
+0x00af6d60 ac_attach_a         # the Build's post-body attach (lr 0x00b0d794): skippable by AC4_COOP_SKIP
+0x00af6d40 ac_attach_b         # the Build's post-body attach (lr 0x00b0d7a0): skippable by AC4_COOP_SKIP
+0x00b02718 ac_attach_c         # the Build's post-body attach (lr 0x00b0d7ac): skippable by AC4_COOP_SKIP
+
+# Co-op: damage and AI-enable seams (research\27_DAMAGE_AND_FREEZE.md; game/coop_hooks.cpp)
+0x00a53900 hp_set               # HP/AP setter: *(+0x2a4)=f1, then the owner is notified; the only object-field HP write
+0x00a5a054 enable_move          # SetEnableMove(self, value): *(*(self+0xa0)+320)=value (the mission scripts' move switch)
+0x00a5a084 enable_attack        # SetEnableAttack(self, value): command 25 on *(self+0xa0) (the mission scripts' attack switch)
+0x00a569f0 hp_update             # the AC per-frame HP/PA update: the second (and only other) object-field HP writer
+0x00af4cd0 move_enable_lo         # group move switch (r3 ctrl+308, r4 value): the per-entity call the mission layer makes
+0x00a65198 command_dispatch        # controller command dispatcher: command 25 = attack enable (value in r5)
+0x00a68dbc xform_set                # the generic 4x4 setter (dst+0x10 <- src), found by the write watch
+0x00a4f968 xform_blit               # the entity's vtable slot 12: copies src -> this+0x190 and calls the 4x4 setter
+0x004b9eb8 actor_update             # per-object motion update: computes velocity, calls controller vtable+48, which drives the transform blit
+
+# Co-op session: host-driven mission start, load barrier, mission events (research\28; game/coop_session.cpp)
+0x002a6bdc lua_print                # Lua 5.0 print (lbaselib): "\1C<cmd>" is the co-op channel between the mission scripts and the port
+0x00100224 lua_print_engine         # the engine's own print (OPD 0x00e4c948, registered over the stock one): what the mission scripts actually call
+0x007cc0ec flow_ctor_a              # mission-flow scene ctor (this, mission number; vtable 0x101385f8, +104 = mission): host announces, join follows the host
+0x007cc19c flow_ctor_b              # its twin (called from 0x00776ef8 and 0x007eef54)
+0x0074cf88 scene_change             # scene next-request (r3 current scene, r4 next; +24 next, +28 request, +60/+64 fades): logged
+0x007cca94 sortie_start             # the mission screen starts a sortie (flow scene, mission index, r5, r6): host announces, join plays the host's (research\28)
+0x007cd424 flow_tick                # mission-flow scene tick (vtable 0x101385f8 slot 10): the join's automatic start, on the scene thread
+0x004dd4d0 menu_tick                # generic menu-scene update (slot 3 of the hub and the mission list): the join's automatic start (research\28)
+0x00b0e2bc player_cap
+0x00b0e2e4 player_ending
+0x00b0ebe0 player_mode
+0x00b0e718 player_immortal
+0x00b0e4d8 player_result
+0x0068f860 radar_blip_update        # RadarBlipEntry::Update(entry, ctx, dt): keep co-op partner AC2 persistently visible on radar even when stationary (coop_hooks.cpp)

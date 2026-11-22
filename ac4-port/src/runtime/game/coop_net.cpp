@@ -1,0 +1,625 @@
+// Co-op link v0 over WinSock (coop_net.h). See research\24_COOP_LINK_V0.md for the measurements.
+//
+// One non-blocking UDP socket. The host learns its peer from the first packet; the joiner has the
+// peer from its configuration. Nothing here blocks and the peer disappearing only stops the flow
+// (port 1 then returns neutral, so the remote AC simply stands still).
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "runtime/game/coop_build.h"
+#include "runtime/game/coop_body.h"
+#include "runtime/game/coop_net.h"
+#include "runtime/game/coop_session.h"
+#include "runtime/log.h"
+
+namespace {
+
+constexpr char kMagic[4] = {'A', 'C', '4', 'C'};
+constexpr uint8_t kVersion = 1;
+constexpr uint8_t kTypePad = 1;
+constexpr uint8_t kTypeTransform = 2;
+constexpr uint8_t kTypeSnapshot = 3;
+constexpr size_t kHeader = 8;
+constexpr size_t kPadLen = kHeader + 13;
+constexpr size_t kTransformLen = kHeader + 2 + 4 * (3 + 9 + 3) + 12;  // + AP, AP max, look pitch
+constexpr size_t kMaxDatagram = 1200;  // the largest snapshot datagram (research\26 M2)
+constexpr double kPadTimeout = 1.0;    // seconds without a packet: port 1 goes neutral
+constexpr double kPeerTimeout = 5.0;   // seconds without any packet: link considered down (survives load stalls)
+constexpr int kTransformEvery = 3;     // send the transform at ~20 Hz for crisp partner heading/drift sync
+
+#pragma pack(push, 1)
+struct Header {
+  char magic[4];
+  uint8_t version, type;
+  uint16_t seq;
+};
+struct PadPacket {
+  uint16_t buttons;
+  int16_t lx, ly, rx, ry;
+  uint8_t lt, rt, port;
+};
+struct TransformPacket {
+  int16_t mission_tag;
+  float position[3];
+  float rotation[9];  // rows 0-2 of the body's 4x4, row-major
+  float velocity[3];
+  float ap, apmax;    // AP of the AC the sender simulates for the peer (research\27)
+  float pitch;        // local player look pitch in radians (NaN if unavailable)
+};
+// Type 3: one snapshot, split over datagrams. `tag` carries the host's entity-pool base so the join
+// can log both bases beside each other; `counter` counts whole snapshots.
+struct SnapshotPayload {
+  uint32_t counter;
+  uint32_t tag;
+  uint16_t count;
+  uint16_t epoch;  // the host's mission epoch (coop_session.h); was reserved (0)
+};
+struct SnapshotRecordWire {
+  uint16_t ord;
+  uint16_t reserved;
+  uint32_t addr;
+  uint32_t entity_id;
+  float position[3];
+  float rotation[9];
+  float hp;
+};
+#pragma pack(pop)
+static_assert(sizeof(Header) == 8, "8-byte header");
+static_assert(sizeof(PadPacket) == 13, "pad payload");
+static_assert(sizeof(TransformPacket) == 2 + 4 * 15 + 12, "transform payload");
+static_assert(sizeof(SnapshotPayload) == 12, "snapshot payload header");
+static_assert(sizeof(SnapshotRecordWire) == 64, "snapshot record");
+static_assert(kHeader + sizeof(SnapshotPayload) + 18 * sizeof(SnapshotRecordWire) <= kMaxDatagram,
+              "18 records fit in one datagram");
+
+SOCKET g_sock = INVALID_SOCKET;
+bool g_host = false;
+sockaddr_in g_peer{};
+bool g_have_peer = false;
+bool g_started = false;
+
+std::atomic<uint64_t> g_sent{0}, g_recv{0}, g_dropped{0}, g_bad{0};
+std::atomic<uint64_t> g_frames{0};
+std::atomic<uint32_t> g_last_pad_ms{0}, g_last_xform_ms{0}, g_last_sim_ms{0};
+std::atomic<bool> g_seq_reset{false};  // set on peer change/reconnect so a restarted peer's seq=1 is accepted
+int g_sim_latency_ms = 0, g_sim_jitter_ms = 0;  // optional AC4_COOP_SIM_LATENCY_MS / AC4_COOP_SIM_JITTER_MS
+struct DelayedPkt {
+  uint64_t deliver_ms;
+  sockaddr_in peer;
+  std::vector<uint8_t> bytes;
+};
+std::mutex g_delay_mu;
+std::deque<DelayedPkt> g_delay_q;
+uint32_t g_rng_state = 0x9e3779b9u;
+
+std::mutex g_mu;
+std::mutex g_rx_mu;  // receive_all: the frame and the load barrier may both pump
+rt::game::coopnet::PadState g_local_pad;  // this instance's port 0, PS3 layout (set by sys_io)
+rt::game::coopnet::PadState g_pad;      // the peer's pad, as last received
+rt::game::coopnet::Transform g_xform;   // the peer's AC1 transform
+std::atomic<bool> g_have_xform{false};
+std::atomic<float> g_pos_error{0};
+
+std::atomic<uint64_t> g_snap_sent_recs{0}, g_snap_sent_pkts{0}, g_snap_recv_recs{0};
+std::atomic<uint32_t> g_snap_counter{0}, g_snap_tag{0};
+std::vector<rt::game::coopnet::SnapshotRecord> g_snap_in;  // received, drained by take_snapshot()
+
+uint16_t g_pad_seq = 0, g_xform_seq = 0, g_snap_seq = 0;
+float g_local_pos[3] = {};
+float g_local_rot[9] = {};
+float g_local_vel[3] = {};
+float g_local_ap = 0.0f, g_local_apmax = 0.0f;
+std::atomic<float> g_local_pitch{NAN};
+int g_mission_tag = 0;
+double g_last_report = -1e9;
+
+uint32_t now_ms() { return uint32_t(GetTickCount64() & 0xffffffffu); }
+
+bool env(const char* name, char* buf, size_t n) {
+  DWORD got = GetEnvironmentVariableA(name, buf, DWORD(n));
+  return got > 0 && got < n;
+}
+
+// Splits "ip:port" (the port may be omitted: 7777).
+bool parse_endpoint(const std::string& s, sockaddr_in* out) {
+  std::string ip = s;
+  unsigned port = 7777;
+  size_t colon = s.find_last_of(':');
+  if (colon != std::string::npos) {
+    ip = s.substr(0, colon);
+    port = unsigned(strtoul(s.substr(colon + 1).c_str(), nullptr, 10));
+  }
+  std::memset(out, 0, sizeof *out);
+  out->sin_family = AF_INET;
+  out->sin_port = htons(uint16_t(port));
+  if (inet_pton(AF_INET, ip.c_str(), &out->sin_addr) != 1) return false;
+  return true;
+}
+
+void note_peer(const sockaddr_in& from) {
+  std::lock_guard lk(g_mu);
+  if (g_have_peer && from.sin_addr.s_addr == g_peer.sin_addr.s_addr && from.sin_port == g_peer.sin_port) return;
+  g_peer = from;
+  g_have_peer = true;
+  g_seq_reset.store(true, std::memory_order_relaxed);
+  char ip[64] = {};
+  inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip);
+  LOG_I("coop", "COOP NET: peer %s:%u", ip, unsigned(ntohs(from.sin_port)));
+}
+
+void flush_delayed_sends() {
+  if (g_sim_latency_ms <= 0 || g_sock == INVALID_SOCKET) return;
+  const uint64_t now = GetTickCount64();
+  std::vector<DelayedPkt> due;
+  {
+    std::lock_guard lk(g_delay_mu);
+    while (!g_delay_q.empty() && g_delay_q.front().deliver_ms <= now) {
+      due.push_back(std::move(g_delay_q.front()));
+      g_delay_q.pop_front();
+    }
+  }
+  for (const auto& p : due) {
+    if (sendto(g_sock, reinterpret_cast<const char*>(p.bytes.data()), int(p.bytes.size()), 0,
+               reinterpret_cast<const sockaddr*>(&p.peer), sizeof p.peer) != SOCKET_ERROR) {
+      g_sent.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
+void send_packet(uint8_t type, uint16_t seq, const void* payload, size_t len) {
+  if (g_sock == INVALID_SOCKET) return;
+  sockaddr_in peer;
+  {
+    std::lock_guard lk(g_mu);
+    if (!g_have_peer) return;
+    peer = g_peer;
+  }
+  uint8_t buf[kMaxDatagram];
+  if (kHeader + len > sizeof buf) return;
+  Header h{};
+  std::memcpy(h.magic, kMagic, 4);
+  h.version = kVersion;
+  h.type = type;
+  h.seq = seq;
+  std::memcpy(buf, &h, kHeader);
+  std::memcpy(buf + kHeader, payload, len);
+  if (g_sim_latency_ms > 0) {
+    int delay = g_sim_latency_ms;
+    std::lock_guard lk(g_delay_mu);
+    if (g_sim_jitter_ms > 0) {
+      g_rng_state = g_rng_state * 1664525u + 1013904223u;
+      const int span = 2 * g_sim_jitter_ms + 1;
+      delay += int(g_rng_state % uint32_t(span)) - g_sim_jitter_ms;
+      if (delay < 0) delay = 0;
+    }
+    const uint64_t at = GetTickCount64() + uint64_t(delay);
+    if (g_delay_q.size() < 4096) {
+      DelayedPkt dp{at, peer, std::vector<uint8_t>(buf, buf + kHeader + len)};
+      // Keep queue sorted by deliver_ms so flush pops in order even with jitter.
+      auto it = g_delay_q.end();
+      while (it != g_delay_q.begin() && std::prev(it)->deliver_ms > at) --it;
+      g_delay_q.insert(it, std::move(dp));
+    }
+    return;
+  }
+  if (sendto(g_sock, reinterpret_cast<const char*>(buf), int(kHeader + len), 0,
+             reinterpret_cast<const sockaddr*>(&peer), sizeof peer) == SOCKET_ERROR)
+    return;
+  g_sent.fetch_add(1, std::memory_order_relaxed);
+}
+
+void receive_all() {
+  uint8_t buf[kMaxDatagram + 8];
+  for (int i = 0; i < 128; ++i) {  // bounded: never spin on a busy socket
+    sockaddr_in from{};
+    int flen = sizeof from;
+    int n = recvfrom(g_sock, reinterpret_cast<char*>(buf), sizeof buf, 0, reinterpret_cast<sockaddr*>(&from), &flen);
+    if (n == SOCKET_ERROR) {
+      if (WSAGetLastError() != WSAEWOULDBLOCK) g_bad.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    if (n < int(kHeader)) continue;
+    Header h{};
+    std::memcpy(&h, buf, kHeader);
+    if (std::memcmp(h.magic, kMagic, 4) != 0 || h.version != kVersion) {
+      g_bad.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    // The host takes the peer from the first packet; both sides then only accept that peer.
+    if (g_host) note_peer(from);
+    {
+      std::lock_guard lk(g_mu);
+      if (g_have_peer && (from.sin_addr.s_addr != g_peer.sin_addr.s_addr || from.sin_port != g_peer.sin_port)) continue;
+    }
+    // Drop out-of-order and duplicate packets within a type. Reset on peer change or after >5 s
+    // silence so a restarted partner whose sequence numbers start at 1 is accepted immediately.
+    static uint16_t last_pad = 0, last_xform = 0;
+    const uint32_t prev_ms = g_last_pad_ms.load(std::memory_order_relaxed);
+    if (g_seq_reset.exchange(false, std::memory_order_relaxed) ||
+        (prev_ms && now_ms() - prev_ms > uint32_t(kPeerTimeout * 1000))) {
+      last_pad = 0;
+      last_xform = 0;
+    }
+    if (h.type == kTypePad) {
+      if (n < int(kPadLen)) continue;
+      if (int16_t(h.seq - last_pad) <= 0) {
+        g_dropped.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      last_pad = h.seq;
+      PadPacket p{};
+      std::memcpy(&p, buf + kHeader, sizeof p);
+      {
+        std::lock_guard lk(g_mu);
+        g_pad.buttons = p.buttons;
+        g_pad.lx = p.lx;
+        g_pad.ly = p.ly;
+        g_pad.rx = p.rx;
+        g_pad.ry = p.ry;
+        g_pad.lt = p.lt;
+        g_pad.rt = p.rt;
+      }
+      g_last_pad_ms = now_ms();
+      g_recv.fetch_add(1, std::memory_order_relaxed);
+    } else if (h.type == kTypeTransform) {
+      if (n < int(kTransformLen)) continue;
+      if (int16_t(h.seq - last_xform) <= 0) {
+        g_dropped.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      last_xform = h.seq;
+      TransformPacket t{};
+      std::memcpy(&t, buf + kHeader, sizeof t);
+      {
+        std::lock_guard lk(g_mu);
+        g_xform.mission_tag = t.mission_tag;
+        std::memcpy(g_xform.position, t.position, sizeof t.position);
+        std::memcpy(g_xform.rotation, t.rotation, sizeof t.rotation);
+        std::memcpy(g_xform.velocity, t.velocity, sizeof t.velocity);
+        g_xform.ap = t.ap;
+        g_xform.apmax = t.apmax;
+        g_xform.has_pitch = std::isfinite(t.pitch) && std::fabs(t.pitch) <= 1.6f;
+        if (g_xform.has_pitch) g_xform.pitch = t.pitch;
+        ++g_xform.samples;
+      }
+      g_have_xform = true;
+      g_last_xform_ms = now_ms();
+      g_recv.fetch_add(1, std::memory_order_relaxed);
+    } else if (h.type >= 4 && h.type <= 6) {
+      g_last_pad_ms = now_ms();  // any session packet proves the peer is alive
+      g_recv.fetch_add(1, std::memory_order_relaxed);
+      rt::game::coopsession::on_packet(h.type, buf + kHeader, size_t(n) - kHeader);
+    } else if (h.type == kTypeSnapshot) {
+      // Records are absolute state, so a datagram that arrives late is still usable; only the
+      // sequence guard of the other types is skipped here.
+      if (n < int(kHeader + sizeof(SnapshotPayload))) continue;
+      SnapshotPayload sp{};
+      std::memcpy(&sp, buf + kHeader, sizeof sp);
+      g_last_pad_ms = now_ms();
+      if (sp.epoch != rt::game::coopsession::epoch() || !rt::game::coopsession::linked_in_mission()) {
+        g_dropped.fetch_add(1, std::memory_order_relaxed);
+        continue;  // a snapshot of another mission instance, or this side is not in the mission yet
+      }
+      const size_t avail = (size_t(n) - kHeader - sizeof sp) / sizeof(SnapshotRecordWire);
+      size_t count = sp.count;
+      if (count > avail) count = avail;
+      std::lock_guard lk(g_mu);
+      for (size_t i = 0; i < count; ++i) {
+        SnapshotRecordWire w{};
+        std::memcpy(&w, buf + kHeader + sizeof sp + i * sizeof w, sizeof w);
+        rt::game::coopnet::SnapshotRecord r{};
+        r.addr = w.addr;
+        r.entity_id = w.entity_id;
+        r.ord = w.ord;
+        std::memcpy(r.position, w.position, sizeof r.position);
+        std::memcpy(r.rotation, w.rotation, sizeof r.rotation);
+        r.hp = w.hp;
+        if (g_snap_in.size() < 8192) g_snap_in.push_back(r);
+      }
+      g_snap_recv_recs.fetch_add(count, std::memory_order_relaxed);
+      if (sp.counter > g_snap_counter.load(std::memory_order_relaxed)) g_snap_counter = sp.counter;
+      g_snap_tag = sp.tag;
+      g_last_pad_ms = now_ms();  // a snapshot also proves the peer is alive
+      g_recv.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
+}  // namespace
+
+namespace rt::game::coopnet {
+
+bool init() {
+  if (g_started) return g_sock != INVALID_SOCKET;
+  g_started = true;
+  char host[64]{}, join[128]{};
+  bool want_host = env("AC4_COOP_HOST", host, sizeof host);
+  bool want_join = env("AC4_COOP_JOIN", join, sizeof join);
+  if (!want_host && !want_join) return false;
+
+  WSADATA wsa{};
+  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+    LOG_E("coop", "COOP NET: WSAStartup failed; no link");
+    return false;
+  }
+  g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (g_sock == INVALID_SOCKET) {
+    LOG_E("coop", "COOP NET: socket() failed (%d); no link", WSAGetLastError());
+    return false;
+  }
+  u_long nonblocking = 1;
+  ioctlsocket(g_sock, FIONBIO, &nonblocking);
+
+  if (want_host) {
+    const unsigned port = unsigned(strtoul(host, nullptr, 10));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(uint16_t(port));
+    if (bind(g_sock, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == SOCKET_ERROR) {
+      LOG_E("coop", "COOP NET: bind udp/%u failed (%d); no link", port, WSAGetLastError());
+      closesocket(g_sock);
+      g_sock = INVALID_SOCKET;
+      return false;
+    }
+    g_host = true;
+    LOG_I("coop", "COOP NET: host, listening on udp/%u (the peer is whoever sends first)", port);
+  } else {
+    sockaddr_in addr{};
+    if (!parse_endpoint(join, &addr)) {
+      LOG_E("coop", "COOP NET: bad AC4_COOP_JOIN '%s' (want ip:port); no link", join);
+      closesocket(g_sock);
+      g_sock = INVALID_SOCKET;
+      return false;
+    }
+    {
+      std::lock_guard lk(g_mu);
+      g_peer = addr;
+      g_have_peer = true;
+    }
+    char ip[64] = {};
+    inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof ip);
+    LOG_I("coop", "COOP NET: joining %s:%u", ip, unsigned(ntohs(addr.sin_port)));
+  }
+  char sim_buf[32]{};
+  if (env("AC4_COOP_SIM_LATENCY_MS", sim_buf, sizeof sim_buf)) {
+    g_sim_latency_ms = std::atoi(sim_buf);
+    if (env("AC4_COOP_SIM_JITTER_MS", sim_buf, sizeof sim_buf)) g_sim_jitter_ms = std::atoi(sim_buf);
+    if (g_sim_latency_ms > 0)
+      LOG_W("coop", "COOP NET: simulated one-way latency %d ms (+/- %d ms jitter)", g_sim_latency_ms, g_sim_jitter_ms);
+  }
+  return true;
+}
+
+bool active() { return g_sock != INVALID_SOCKET; }
+
+bool role_host() { return active() && g_host; }
+bool role_join() { return active() && !g_host; }
+
+size_t send_snapshot(const SnapshotRecord* recs, size_t n, uint32_t tag) {
+  if (!role_host()) return 0;
+  const size_t per = (kMaxDatagram - kHeader - sizeof(SnapshotPayload)) / sizeof(SnapshotRecordWire);
+  const uint32_t counter = g_snap_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+  size_t pkts = 0;
+  size_t off = 0;
+  do {
+    const size_t count = (n - off) < per ? (n - off) : per;
+    uint8_t payload[kMaxDatagram - kHeader];
+    SnapshotPayload sp{};
+    sp.counter = counter;
+    sp.tag = tag;
+    sp.count = uint16_t(count);
+    sp.epoch = rt::game::coopsession::epoch();
+    std::memcpy(payload, &sp, sizeof sp);
+    for (size_t i = 0; i < count; ++i) {
+      SnapshotRecordWire w{};
+      w.addr = recs[off + i].addr;
+      w.entity_id = recs[off + i].entity_id;
+      w.ord = recs[off + i].ord;
+      std::memcpy(w.position, recs[off + i].position, sizeof w.position);
+      std::memcpy(w.rotation, recs[off + i].rotation, sizeof w.rotation);
+      w.hp = recs[off + i].hp;
+      std::memcpy(payload + sizeof sp + i * sizeof w, &w, sizeof w);
+    }
+    send_packet(kTypeSnapshot, ++g_snap_seq, payload, sizeof sp + count * sizeof(SnapshotRecordWire));
+    g_snap_sent_recs.fetch_add(count, std::memory_order_relaxed);
+    g_snap_sent_pkts.fetch_add(1, std::memory_order_relaxed);
+    ++pkts;
+    off += count;
+  } while (off < n);
+  return pkts;
+}
+
+size_t take_snapshot(SnapshotRecord* out, size_t max, uint32_t* counter) {
+  if (!out || !max) return 0;
+  std::lock_guard lk(g_mu);
+  const size_t n = g_snap_in.size() < max ? g_snap_in.size() : max;
+  for (size_t i = 0; i < n; ++i) out[i] = g_snap_in[i];
+  g_snap_in.erase(g_snap_in.begin(), g_snap_in.begin() + std::ptrdiff_t(n));
+  if (counter) *counter = g_snap_counter.load(std::memory_order_relaxed);
+  return n;
+}
+
+void snapshot_totals(uint64_t* sent_recs, uint64_t* sent_pkts, uint64_t* recv_recs) {
+  if (sent_recs) *sent_recs = g_snap_sent_recs.load(std::memory_order_relaxed);
+  if (sent_pkts) *sent_pkts = g_snap_sent_pkts.load(std::memory_order_relaxed);
+  if (recv_recs) *recv_recs = g_snap_recv_recs.load(std::memory_order_relaxed);
+}
+
+uint32_t snapshot_tag() { return g_snap_tag.load(std::memory_order_relaxed); }
+
+bool remote_pad(PadState* out) {
+  if (!active() || !out) return false;
+  if (!rt::game::coopsession::linked_in_mission()) return false;  // menus never see the partner's pad
+  const uint32_t last = g_last_pad_ms.load(std::memory_order_relaxed);
+  if (!last || now_ms() - last > uint32_t(kPadTimeout * 1000)) return false;
+  std::lock_guard lk(g_mu);
+  *out = g_pad;
+  return true;
+}
+
+bool peer_present() {
+  if (!active()) return false;
+  const uint32_t last = g_last_pad_ms.load(std::memory_order_relaxed);
+  return last && now_ms() - last <= uint32_t(kPeerTimeout * 1000);
+}
+
+void set_local_transform(const float position[3], const float rotation[9], const float velocity[3], int mission_tag) {
+  if (!active()) return;
+  std::memcpy(g_local_pos, position, sizeof g_local_pos);
+  std::memcpy(g_local_rot, rotation, sizeof g_local_rot);
+  std::memcpy(g_local_vel, velocity, sizeof g_local_vel);
+  g_mission_tag = mission_tag;
+}
+
+void set_local_peer_ap(float ap, float apmax) {
+  g_local_ap = ap;
+  g_local_apmax = apmax;
+}
+
+void set_local_pitch(float pitch) {
+  if (std::isfinite(pitch) && std::fabs(pitch) <= 1.6f) g_local_pitch.store(pitch, std::memory_order_relaxed);
+}
+
+bool remote_pitch(float* pitch) {
+  if (!active() || !g_have_xform.load(std::memory_order_relaxed) || !pitch) return false;
+  if (!rt::game::coopsession::linked_in_mission()) return false;
+  std::lock_guard lk(g_mu);
+  if (uint16_t(g_xform.mission_tag) != rt::game::coopsession::epoch() || !g_xform.has_pitch) return false;
+  *pitch = g_xform.pitch;
+  return true;
+}
+
+bool peer_ap(float* ap, float* apmax) {
+  if (!active() || !g_have_xform.load(std::memory_order_relaxed)) return false;
+  if (!rt::game::coopsession::linked_in_mission()) return false;
+  std::lock_guard lk(g_mu);
+  if (uint16_t(g_xform.mission_tag) != rt::game::coopsession::epoch()) return false;
+  // A missing/freed body reads 0/0; only a real AC's AP pair (thousands of points) is authoritative.
+  if (g_xform.apmax < 1000.0f) return false;
+  if (ap) *ap = g_xform.ap;
+  if (apmax) *apmax = g_xform.apmax;
+  return true;
+}
+
+bool remote_transform(Transform* out) {
+  if (!active() || !g_have_xform.load(std::memory_order_relaxed) || !out) return false;
+  if (!rt::game::coopsession::linked_in_mission()) return false;
+  std::lock_guard lk(g_mu);
+  if (uint16_t(g_xform.mission_tag) != rt::game::coopsession::epoch()) return false;
+  *out = g_xform;
+  const uint32_t last = g_last_xform_ms.load(std::memory_order_relaxed);
+  out->age_ms = last ? (now_ms() - last) : 0;
+  return true;
+}
+
+float last_position_error() { return g_pos_error.load(std::memory_order_relaxed); }
+
+void note_local_sim_tick() { g_last_sim_ms.store(now_ms(), std::memory_order_relaxed); }
+
+bool local_paused() {
+  if (!active() || !rt::game::coopsession::linked_in_mission()) return false;
+  const uint32_t last = g_last_sim_ms.load(std::memory_order_relaxed);
+  return last != 0 && (now_ms() - last > 120u);
+}
+
+void pump() {
+  if (!active()) return;
+  flush_delayed_sends();
+  std::lock_guard lk(g_rx_mu);
+  receive_all();
+}
+
+void send_raw(uint8_t type, const void* payload, size_t len) {
+  if (!active()) return;
+  send_packet(type, 0, payload, len);
+}
+
+void set_local_pad(const PadState& p) {
+  std::lock_guard lk(g_mu);
+  g_local_pad = p;
+}
+
+void frame(const PadState&) {
+  if (!active()) return;
+  pump();
+  rt::game::coopsession::frame();
+  PadState local;
+  {
+    std::lock_guard lk(g_mu);
+    local = g_local_pad;
+  }
+  const bool paused = local_paused();
+  static bool was_paused = false;
+  const bool just_unpaused = was_paused && !paused;
+  if (paused != was_paused) {
+    LOG_I("coop", "COOP NET: local simulation %s", paused ? "PAUSED (sending neutral pad)" : "RESUMED (forcing transform sync)");
+    was_paused = paused;
+  }
+  if (!rt::game::coopsession::linked_in_mission() || paused) local = PadState{};  // neutral outside a mission or while paused
+  const uint64_t f = g_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  PadPacket p{};
+  p.buttons = local.buttons;
+  p.lx = local.lx;
+  p.ly = local.ly;
+  p.rx = local.rx;
+  p.ry = local.ry;
+  p.lt = local.lt;
+  p.rt = local.rt;
+  p.port = 0;
+  send_packet(kTypePad, ++g_pad_seq, &p, sizeof p);
+
+  if (f % uint64_t(kTransformEvery) == 0 || just_unpaused) {
+    TransformPacket t{};
+    t.mission_tag = int16_t(rt::game::coopsession::epoch());
+    std::memcpy(t.position, g_local_pos, sizeof t.position);
+    std::memcpy(t.rotation, g_local_rot, sizeof t.rotation);
+    if (!paused) std::memcpy(t.velocity, g_local_vel, sizeof t.velocity);
+    t.ap = g_local_ap;
+    t.apmax = g_local_apmax;
+    t.pitch = g_local_pitch.load(std::memory_order_relaxed);
+    send_packet(kTypeTransform, ++g_xform_seq, &t, sizeof t);
+  }
+  flush_delayed_sends();
+
+  // The error the caller (coop_body.cpp) acts on: the local AC2 against the peer's AC1.
+  Transform t;
+  double local_pos[3];
+  if (remote_transform(&t) && rt::game::coop_body_position(2, local_pos) &&
+      (t.position[0] * t.position[0] + t.position[1] * t.position[1] + t.position[2] * t.position[2] > 1.0f)) {
+    const double dx = local_pos[0] - t.position[0], dy = local_pos[1] - t.position[1], dz = local_pos[2] - t.position[2];
+    const double err = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (std::isfinite(err)) g_pos_error = float(err);
+  }
+}
+
+void report() {
+  if (!active()) return;
+  const double now = rt::log_time();
+  if (now - g_last_report < 1.0) return;
+  g_last_report = now;
+  Transform t;
+  const bool have = remote_transform(&t);
+  const bool peer = peer_present();
+  LOG_I("coop", "COOP NET: %s | sent %llu recv %llu dropped %llu bad %llu | peer %s | pad age %u ms | xform %s, error %.2f | snap sent %llu rec in %llu pkt, recv %llu rec",
+        g_host ? "host" : "join", (unsigned long long)g_sent.load(), (unsigned long long)g_recv.load(),
+        (unsigned long long)g_dropped.load(), (unsigned long long)g_bad.load(), peer ? "UP" : "down",
+        unsigned(now_ms() - g_last_pad_ms.load(std::memory_order_relaxed)),
+        have ? ac4::strprintf("%u samples, mission %d", t.samples, t.mission_tag).c_str() : "none",
+        double(g_pos_error.load()), (unsigned long long)g_snap_sent_recs.load(),
+        (unsigned long long)g_snap_sent_pkts.load(), (unsigned long long)g_snap_recv_recs.load());
+}
+
+}  // namespace rt::game::coopnet

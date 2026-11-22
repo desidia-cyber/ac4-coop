@@ -1,0 +1,52 @@
+// Launcher resources: the application manifest (common controls 6, per-monitor DPI awareness,
+// UTF-8 code page) and version information (VERSION, through CMake). A release launcher also
+// carries the port's sources (resource 2, launcher_source.rc in the build folder; source.h).
+#include <windows.h>
+
+// "0.2.0" from the numbers (string definitions lose their quotes on the way to the resource compiler).
+#define AC4_STRING2(x) #x
+#define AC4_STRING(x) AC4_STRING2(x)
+#define AC4_VERSION_TEXT AC4_STRING(AC4_VERSION_MAJOR.AC4_VERSION_MINOR.AC4_VERSION_PATCH)
+
+1 RT_MANIFEST "launcher.manifest"
+
+// The port's icon (data/ac4.ico: 16, 32 and 48 px): the file's icon and the window's.
+1 ICON "../../data/ac4.ico"
+
+#include "resource.h"
+
+// After the first successful Set up: which shortcuts to add (main.cpp offer_shortcuts).
+IDD_SHORTCUTS DIALOGEX 0, 0, 212, 92
+STYLE DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "ARMORED CORE 4"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+  LTEXT "Set up is done.", -1, 12, 10, 190, 10
+  AUTOCHECKBOX "Add a &desktop shortcut", IDC_SHORTCUT_DESKTOP, 12, 26, 190, 10, WS_TABSTOP
+  AUTOCHECKBOX "Add a &Start menu entry", IDC_SHORTCUT_START_MENU, 12, 39, 190, 10, WS_TABSTOP
+  LTEXT "They open the launcher; PLAY starts the game. More... adds or removes them later.", -1, 12, 54, 190, 18
+  DEFPUSHBUTTON "OK", IDOK, 150, 72, 50, 14
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION AC4_VERSION_MAJOR,AC4_VERSION_MINOR,AC4_VERSION_PATCH,0
+PRODUCTVERSION AC4_VERSION_MAJOR,AC4_VERSION_MINOR,AC4_VERSION_PATCH,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "FileDescription", "ARMORED CORE 4 PC port launcher"
+      VALUE "ProductName", "ARMORED CORE 4 PC port (unofficial)"
+      VALUE "FileVersion", AC4_VERSION_TEXT
+      VALUE "ProductVersion", AC4_VERSION_TEXT
+      VALUE "OriginalFilename", "AC4-Launcher.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

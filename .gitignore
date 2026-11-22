@@ -1,0 +1,93 @@
+# ==============================================================================
+# Armored Core 4 Co-op Mod — .gitignore
+# Excludes all copyrighted game/disc assets, builds, saves, logs, and toolchains.
+# ==============================================================================
+
+# Copyrighted game files, disc dumps, ISOs, extracted assets, and generated overlays
+/disc/
+/disc_lists/
+/extracted/
+/raw_iso/
+/payload/
+/backups/
+/acfa-port/
+
+# Build outputs, generated PPU/SPU C++, and downloaded toolchains
+/build/
+/build-llvm/
+/ac4-port/local/
+/tools/rpcs3/
+/tools/work/
+/tools/*.zip
+/tools/*.7z
+/tools/**/*.pkl
+
+# Runtime game data, saves, screenshots, and logs
+/run/data/
+/run/data2/
+/run/data3/
+/run/shots/
+/run/logs/
+/run/save_*/
+/run/save_import/
+/run/*.log
+/run/*.err
+/build.log
+/_lastrun.txt
+
+# Raw research logs, screenshots, meter dumps, and backup scratch folders
+/research/**/*.log
+/research/**/*.err
+/research/**/*.png
+/research/**/*.txt
+/research/**/*.tsv
+/research/19_backup/
+/research/e9_raw/
+/research/e10_raw/
+/research/e11_raw/
+/research/s28_logs/
+
+# Game binary/asset extensions (defense-in-depth — never commit game data)
+*.iso
+*.ISO
+*.exe
+*.dll
+*.pkg
+*.PUP
+*.pup
+*.elf
+*.self
+*.sprx
+*.prx
+*.SFO
+*.SFB
+*.BIN
+*.bin
+*.pam
+*.bnd
+*.bdt
+*.bhd
+*.tpf
+*.drb
+*.fmg
+*.000
+*.001
+*.002
+*.003
+*.rap
+*.edat
+*.zip
+*.7z
+*.obj
+*.a
+*keys*.txt
+
+# Python & OS/editor noise
+__pycache__/
+*.pyc
+*.pyo
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

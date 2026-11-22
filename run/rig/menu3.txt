@@ -1,0 +1,10 @@
+# network dialog appears ~18s: dismiss it, then START
+0.0   0 none   0 0 0 0
+20.0  0 A      0 0 0 0
+20.6  0 none   0 0 0 0
+24.0  0 A      0 0 0 0
+24.6  0 none   0 0 0 0
+28.0  0 START  0 0 0 0
+28.6  0 none   0 0 0 0
+34.0  0 A      0 0 0 0
+34.6  0 none   0 0 0 0
