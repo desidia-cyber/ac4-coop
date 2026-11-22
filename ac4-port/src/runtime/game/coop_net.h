@@ -45,9 +45,12 @@ bool peer_present();
 // pad/transform path; the send itself happens every 6th frame.
 void set_local_transform(const float position[3], const float rotation[9], const float velocity[3], int mission_tag);
 
-// The AP of the AC this instance simulates for the PEER (its AC2). On the host that is the join
-// player, so the join can make the host's AP authoritative for its own AC1 (research\27).
+// The AP/PA of the AC this instance simulates for the PEER (its AC2). On the host that is the join
+// player, so the join can make the host's AP & PA authoritative for its own AC1 (research\27).
 void set_local_peer_ap(float ap, float apmax);
+void set_local_peer_pa(float pa, float pamax);
+// The AP/PA of this instance's OWN AC1 (sent to the partner for the Partner AP/PA HUD).
+void set_local_self_vitals(float ap, float apmax, float pa, float pamax);
 // The local player AC's vertical look pitch in radians (from look control +48, so mouse vertical aim
 // replicates to the partner's AC2 even though mouse pitch bypasses the right stick).
 void set_local_pitch(float pitch);
@@ -61,6 +64,15 @@ bool local_paused();
 // The AP last received for the peer-controlled AC (the host's AC2 on the join). False until a
 // transform packet carrying it has arrived.
 bool peer_ap(float* ap, float* apmax);
+// Authoritative partner vitals for the co-op HUD (host reads body2 locally; join reads host's self vitals).
+struct PartnerVitals {
+  float ap = 0.0f, apmax = 0.0f;
+  float pa = 0.0f, pamax = 0.0f;
+  bool paused = false;
+  bool peer_up = false;
+  bool valid = false;
+};
+PartnerVitals partner_vitals();
 
 // The role this instance runs as, from AC4_COOP_HOST / AC4_COOP_JOIN (research\26).
 bool role_host();
@@ -103,11 +115,18 @@ struct Transform {
   float position[3] = {};
   float rotation[9] = {};
   float velocity[3] = {};
-  float ap = 0.0f;      // AP of the peer-controlled AC (host's AC2), added in research\27
+  float ap = 0.0f;        // AP of the peer-controlled AC (host's AC2), added in research\27
   float apmax = 0.0f;
-  float pitch = 0.0f;   // look pitch in radians (mouse/gamepad vertical aim)
+  float pitch = 0.0f;     // look pitch in radians (mouse/gamepad vertical aim)
   bool has_pitch = false;
-  uint32_t age_ms = 0;  // milliseconds since this transform sample was received
+  float self_ap = 0.0f;   // sender's own AC1 AP/PA (for partner HUD)
+  float self_apmax = 0.0f;
+  float peer_pa = 0.0f;   // sender's AC2 PA (host -> join authoritative PA)
+  float peer_pamax = 0.0f;
+  float self_pa = 0.0f;
+  float self_pamax = 0.0f;
+  bool peer_paused = false;
+  uint32_t age_ms = 0;    // milliseconds since this transform sample was received
   uint32_t samples = 0;
 };
 bool remote_transform(Transform* out);

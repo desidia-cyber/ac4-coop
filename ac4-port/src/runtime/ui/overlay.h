@@ -41,6 +41,10 @@ DialogHit dialog_hit(const DialogView& v, int x, int y);
 
 // Something of the port's own is on screen (PC SETTINGS or a system dialog): drawn over the frame.
 bool screen_up();
+// Non-interactive co-op HUD overlay (Partner AP/PA bar or load-barrier banner): drawn over the
+// frame without stealing controller/mouse input.
+bool hud_active();
+void toggle_coop_hud();
 
 bool is_open();  // any thread
 // The SYSTEM menu's PC SETTINGS row was chosen: opens the screen; closing it returns to the menu.

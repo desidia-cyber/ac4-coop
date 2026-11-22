@@ -25,6 +25,7 @@
 #include "ppu/ppu_recomp.h"
 #include "runtime/game/coop_body.h"
 #include "runtime/game/coop_build.h"
+#include "runtime/game/coop_entities.h"
 #include "runtime/game/coop_net.h"
 #include "runtime/game/coop_watch.h"
 #include "runtime/log.h"
@@ -169,6 +170,8 @@ void hook_xform_blit(Ctx& ctx, void (*orig)(Ctx&)) {
       LOG_I("coop", "COOP XBLIT entity 0x%08x <- src 0x%08x caller 0x%08x (%llu)", self, src, u32(ctx.lr),
             (unsigned long long)c);
   }
+  // Instant 1-frame actor discovery for newly spawned reinforcements on both host and join.
+  if (rt::game::coopnet::active() && self >= 0x10000000u) rt::game::coop_entities_note_live(self);
   // The freeze: this blit is what moves the entity's live +0x10 transform. On the join, for every
   // non-player entity, do not run it once both player ACs are built (during BUILD#1/BUILD#2 both
   // bodies and initial mission spawns must receive their spawn transforms!).
@@ -195,6 +198,7 @@ void hook_actor_update(Ctx& ctx, void (*orig)(Ctx&)) {
     return GetEnvironmentVariableA("AC4_COOP_FREEZE_AI", b, sizeof b) > 0 && b[0] == '1';
   }();
   const u32 self = u32(ctx.r[3]);
+  if (rt::game::coopnet::active() && self >= 0x10000000u) rt::game::coop_entities_note_live(self);
   const u32 b1 = rt::game::coop_body(1), b2 = rt::game::coop_body(2);
   if (freeze_ai && freeze_on() && b1 && b2 && self && self != b1 && self != b2 &&
       rt::vm::committed(self, 8) && r32(self) == 0x10142638 &&

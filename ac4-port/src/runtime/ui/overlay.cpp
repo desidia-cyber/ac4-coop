@@ -18,6 +18,8 @@
 #include "common/settings_file.h"
 #include "runtime/bindings.h"
 #include "runtime/config.h"
+#include "runtime/game/coop_net.h"
+#include "runtime/game/coop_session.h"
 #include "runtime/gamepads.h"
 #include "runtime/gpu/display.h"
 #include "runtime/gpu/window.h"
@@ -132,6 +134,7 @@ bool g_restore_capture = false;
 int g_client_w = 1280, g_client_h = 720;
 bool g_drag_slider = false;
 std::atomic<u16> g_suppress[4];
+std::atomic<bool> g_coop_hud_hidden{false};  // F8 toggles the co-op Partner AP/PA HUD
 u16 g_pad_held = 0;  // controller buttons held during the last poll (window thread)
 
 std::vector<Row> build_rows(int page) {
@@ -726,6 +729,18 @@ bool is_open() { return g_state.load(std::memory_order_relaxed) != State::Closed
 
 bool screen_up() { return is_open() || sysdlg::shown(); }
 
+bool hud_active() {
+  if (!game::coopnet::active()) return false;
+  if (!game::coopsession::hud_banner().empty()) return true;
+  if (g_coop_hud_hidden.load(std::memory_order_relaxed)) return false;
+  return game::coopsession::linked_in_mission() && game::coopnet::partner_vitals().valid;
+}
+
+void toggle_coop_hud() {
+  if (!game::coopnet::active()) return;
+  g_coop_hud_hidden.store(!g_coop_hud_hidden.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
 DialogHit dialog_hit(const DialogView& v, int px, int py) {
   int w = 0, h = 0;
   gpu::window_client_size(&w, &h);
@@ -956,7 +971,7 @@ struct Gfx {
   ID2D1DeviceContext* dc = nullptr;
   IDWriteFactory* dw = nullptr;
   IDWriteTextFormat *title = nullptr, *subtitle = nullptr, *label = nullptr, *value = nullptr, *small = nullptr, *help = nullptr,
-                    *tab = nullptr, *button = nullptr;
+                    *tab = nullptr, *button = nullptr, *hud_label = nullptr;
   // System dialogs: heading, wrapped text, list rows, dates, on-screen keys.
   IDWriteTextFormat *dlg_title = nullptr, *body = nullptr, *row = nullptr, *date = nullptr, *key = nullptr;
   ID2D1SolidColorBrush* brush = nullptr;
@@ -1012,6 +1027,7 @@ bool init_gfx(ID3D11Device* dev) {
   g_gfx.label = text_format(serif, 25, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
   g_gfx.value = text_format(sans, 20, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
   g_gfx.small = text_format(sans, 14, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING);
+  g_gfx.hud_label = text_format(sans, 14, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
   g_gfx.help = text_format(sans, 20, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
   g_gfx.tab = text_format(sans, 17, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
   g_gfx.button = text_format(serif, 25, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -1024,8 +1040,8 @@ bool init_gfx(ID3D11Device* dev) {
   g_gfx.row = text_format(sans, 20, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
   g_gfx.date = text_format(sans, 16, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING);
   g_gfx.key = text_format(sans, 18, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
-  if (!g_gfx.title || !g_gfx.subtitle || !g_gfx.label || !g_gfx.value || !g_gfx.small || !g_gfx.help || !g_gfx.tab || !g_gfx.button ||
-      !g_gfx.dlg_title || !g_gfx.body || !g_gfx.row || !g_gfx.date || !g_gfx.key)
+  if (!g_gfx.title || !g_gfx.subtitle || !g_gfx.label || !g_gfx.value || !g_gfx.small || !g_gfx.hud_label || !g_gfx.help ||
+      !g_gfx.tab || !g_gfx.button || !g_gfx.dlg_title || !g_gfx.body || !g_gfx.row || !g_gfx.date || !g_gfx.key)
     return false;
   g_gfx.dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &g_gfx.brush);
   D2D1_GRADIENT_STOP stops[2] = {{0, D2D1::ColorF(0.27f, 0.32f, 0.37f, 1)}, {1, D2D1::ColorF(0.10f, 0.12f, 0.15f, 1)}};
@@ -1281,10 +1297,78 @@ void draw_dialog(const DialogView& v, u32 w, u32 h) {
   }
 }
 
+void draw_coop_hud(u32 w, u32 h) {
+  if (!game::coopnet::active()) return;
+  const std::string banner = game::coopsession::hud_banner();
+  const bool show_vitals =
+      !g_coop_hud_hidden.load(std::memory_order_relaxed) && game::coopsession::linked_in_mission();
+  const game::coopnet::PartnerVitals v = show_vitals ? game::coopnet::partner_vitals() : game::coopnet::PartnerVitals{};
+  if (banner.empty() && !v.valid) return;
+
+  ID2D1DeviceContext* dc = g_gfx.dc;
+  Canvas c = canvas_for(int(w), int(h));
+  dc->SetTransform(D2D1::Matrix3x2F::Scale(c.scale, c.scale) * D2D1::Matrix3x2F::Translation(c.ox, c.oy));
+  dc->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+  dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+
+  if (v.valid) {
+    // Top-left corner (clear of AC4's top-right radar, top-center AP/weapons, and bottom subtitles).
+    const float x0 = 24.0f, y0 = 24.0f, x1 = 296.0f;
+    const bool has_pa = v.pamax > 100.0f;
+    const float y1 = has_pa ? 98.0f : 84.0f;
+    g_gfx.brush->SetColor(D2D1::ColorF(0.03f, 0.04f, 0.05f, 0.72f));
+    dc->FillRectangle(D2D1::RectF(x0, y0, x1, y1), g_gfx.brush);
+    frame(x0, y0, x1, y1, 0.45f, 0.22f);
+
+    std::string header = game::coopnet::role_host() ? "PARTNER [JOIN]" : "PARTNER [HOST]";
+    if (!v.peer_up) header += "  OFFLINE";
+    else if (v.paused) header += "  PAUSED";
+    text(header, g_gfx.hud_label, x0 + 10.0f, y0 + 4.0f, x0 + 150.0f, y0 + 24.0f, 0.80f);
+
+    const int ap_i = std::max(0, int(std::round(v.ap)));
+    const int apm_i = std::max(1, int(std::round(v.apmax)));
+    const float ratio = std::clamp(v.ap / v.apmax, 0.0f, 1.0f);
+    std::string ap_txt = ac4::strprintf("AP %d / %d", ap_i, apm_i);
+    text(ap_txt, g_gfx.date, x0 + 145.0f, y0 + 4.0f, x1 - 10.0f, y0 + 24.0f, 0.94f);
+
+    // AP bar (green -> amber -> red)
+    const float bx0 = x0 + 10.0f, bx1 = x1 - 10.0f, by0 = y0 + 30.0f, by1 = y0 + 44.0f;
+    g_gfx.brush->SetColor(D2D1::ColorF(0.12f, 0.14f, 0.16f, 0.85f));
+    dc->FillRectangle(D2D1::RectF(bx0, by0, bx1, by1), g_gfx.brush);
+    if (ratio > 0.5f) g_gfx.brush->SetColor(D2D1::ColorF(0.28f, 0.82f, 0.44f, 0.92f));
+    else if (ratio > 0.2f) g_gfx.brush->SetColor(D2D1::ColorF(0.92f, 0.72f, 0.20f, 0.92f));
+    else g_gfx.brush->SetColor(D2D1::ColorF(0.92f, 0.24f, 0.22f, 0.95f));
+    dc->FillRectangle(D2D1::RectF(bx0, by0, bx0 + (bx1 - bx0) * ratio, by1), g_gfx.brush);
+    frame(bx0, by0, bx1, by1, 0.40f, 0.20f);
+
+    // PA bar (cyan)
+    if (has_pa) {
+      const float pratio = std::clamp(v.pa / v.pamax, 0.0f, 1.0f);
+      const float py0 = by1 + 6.0f, py1 = py0 + 8.0f;
+      g_gfx.brush->SetColor(D2D1::ColorF(0.10f, 0.14f, 0.18f, 0.85f));
+      dc->FillRectangle(D2D1::RectF(bx0, py0, bx1, py1), g_gfx.brush);
+      g_gfx.brush->SetColor(D2D1::ColorF(0.32f, 0.78f, 0.96f, 0.88f));
+      dc->FillRectangle(D2D1::RectF(bx0, py0, bx0 + (bx1 - bx0) * pratio, py1), g_gfx.brush);
+      frame(bx0, py0, bx1, py1, 0.35f, 0.18f);
+    }
+    text("F8 HIDE HUD", g_gfx.small, x0 + 10.0f, y1 - 18.0f, x1 - 10.0f, y1 - 2.0f, 0.38f);
+  }
+
+  if (!banner.empty()) {
+    const float bx0 = 180.0f, bx1 = 1100.0f, by0 = 656.0f, by1 = 692.0f;
+    g_gfx.brush->SetColor(D2D1::ColorF(0.03f, 0.04f, 0.05f, 0.86f));
+    dc->FillRectangle(D2D1::RectF(bx0, by0, bx1, by1), g_gfx.brush);
+    frame(bx0, by0, bx1, by1, 0.58f, 0.28f);
+    text(banner, g_gfx.button, bx0 + 12.0f, by0, bx1 - 12.0f, by1, 0.92f);
+  }
+}
+
 }  // namespace
 
 void render(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, u32 w, u32 h) {
-  if (!screen_up() || !backbuffer) return;
+  const bool want_screen = screen_up();
+  const bool want_hud = !want_screen && hud_active();
+  if ((!want_screen && !want_hud) || !backbuffer) return;
   if (!g_gfx.tried) {
     g_gfx.ok = init_gfx(dev);
     if (!g_gfx.ok) LOG_W("ui", "PC SETTINGS cannot be drawn (Direct2D/DirectWrite unavailable)");
@@ -1292,7 +1376,7 @@ void render(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbu
   if (!g_gfx.ok) return;
   Snapshot s;
   bool page = false;
-  {
+  if (want_screen) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     if (g_state.load() != State::Closed) {
       page = true;
@@ -1307,8 +1391,8 @@ void render(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbu
   }
   if (s.rows.empty()) page = false;
   DialogView dv;
-  bool dialog = sysdlg::view(&dv);  // a system dialog: over the game (and over PC SETTINGS)
-  if (!page && !dialog) return;
+  bool dialog = want_screen && sysdlg::view(&dv);  // a system dialog: over the game (and over PC SETTINGS)
+  if (!page && !dialog && !want_hud) return;
   ID3D11DeviceContext1* ctx1 = nullptr;
   if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1)))) return;
   ID3DDeviceContextState* prev = nullptr;
@@ -1321,6 +1405,7 @@ void render(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbu
     if (SUCCEEDED(g_gfx.dc->CreateBitmapFromDxgiSurface(surface, &bp, &target))) {
       g_gfx.dc->SetTarget(target);
       g_gfx.dc->BeginDraw();
+      if (want_hud) draw_coop_hud(w, h);
       if (page) draw(s, w, h);
       if (dialog) draw_dialog(dv, w, h);
       HRESULT hr = g_gfx.dc->EndDraw();

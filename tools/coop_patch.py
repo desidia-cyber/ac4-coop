@@ -63,7 +63,7 @@ if __COOP_RT == nil then
 	function R.isquery( k )
 		return type( k ) == "string" and ( string.find( k, "^Get" ) or string.find( k, "^Is" ) or string.find( k, "^Difficulty" ) ) ~= nil
 	end
-	function R.qwrap( f )
+	function R.qwrap( f, name )
 		return function( ... )
 			-- outside handlers, or inside another query (a Get* helper calling a Get* method): untouched
 			if R.depth == 0 or R.inq then return f( unpack( arg ) ) end
@@ -74,6 +74,22 @@ if __COOP_RT == nil then
 			end
 			R.inq = true
 			local ok, r = pcall( f, unpack( arg ) )
+			-- Co-op host: average GetApRateOfAC(PLAYER) across P1 (1000) & P2 (1001) per ACFA's rule,
+			-- and take min distance for GetDistEntityPair(PLAYER, other) so either player triggers it.
+			if ok and R.role == "host" and type( r ) == "number" then
+				local p1 = ENTITY_ID__PLAYER or 1000
+				if name == "GetApRateOfAC" and arg[ 2 ] == p1 then
+					local ok2, r2 = pcall( f, arg[ 1 ], 1001 )
+					if ok2 and type( r2 ) == "number" and r2 >= 0 and r2 <= 1.01 then
+						r = ( r + r2 ) * 0.5
+					end
+				elseif name == "GetDistEntityPair" and arg[ 2 ] == p1 then
+					local ok2, r2 = pcall( f, arg[ 1 ], 1001, arg[ 3 ] )
+					if ok2 and type( r2 ) == "number" and r2 >= 0 and r2 < r then
+						r = r2
+					end
+				end
+			end
 			R.inq = false
 			if not ok then error( r, 0 ) end
 			if R.q ~= nil then table.insert( R.q, ser( r ) ) end
@@ -87,11 +103,11 @@ if __COOP_RT == nil then
 		end
 		for _, k in ipairs( names ) do
 			R.qorig[ k ] = _G[ k ]
-			_G[ k ] = R.qwrap( _G[ k ] )
+			_G[ k ] = R.qwrap( _G[ k ], k )
 		end
 		if type( math ) == "table" and type( math.random ) == "function" and R.qorig[ "math.random" ] == nil then
 			R.qorig[ "math.random" ] = math.random
-			math.random = R.qwrap( math.random )
+			math.random = R.qwrap( math.random, "math.random" )
 		end
 		return table.getn( names )
 	end
@@ -124,7 +140,7 @@ if __COOP_RT == nil then
 			local n = 0
 			for k, v in pairs( idx ) do
 				if type( v ) == "function" then
-					if R.isquery( k ) then idx[ k ] = R.qwrap( v ); n = n + 1
+					if R.isquery( k ) then idx[ k ] = R.qwrap( v, k ); n = n + 1
 					elseif P2_MIRROR[ k ] then idx[ k ] = R.p2mwrap( v ) end
 				end
 			end
@@ -135,7 +151,7 @@ if __COOP_RT == nil then
 				local v = idx( t, k )
 				if type( v ) == "function" then
 					if R.isquery( k ) then
-						if cache[ k ] == nil then cache[ k ] = R.qwrap( v ) end
+						if cache[ k ] == nil then cache[ k ] = R.qwrap( v, k ) end
 						return cache[ k ]
 					elseif P2_MIRROR[ k ] then
 						if cache[ k ] == nil then cache[ k ] = R.p2mwrap( v ) end
@@ -177,7 +193,9 @@ if __COOP_RT == nil then
 			for i = 1, arg.n do s = s .. "\2" .. ser( arg[ i ] ) end
 			R.depth = 1
 			R.q = {}
+			print( "\1Chbeg" )
 			local r = { pcall( f, unpack( arg ) ) }
+			print( "\1Chend" )
 			R.depth = 0
 			-- published after the run: the query results it saw go with it ("\3" then "\2"-separated)
 			print( "\1Cev\2" .. s .. "\3" .. table.concat( R.q, "\2" ) )
@@ -193,28 +211,35 @@ if __COOP_RT == nil then
 		for k = 1, 64 do
 			local s = print( "\1Cpoll" )
 			if s == nil then break end
-			local cut = string.find( s, "\3", 1, 1 )
-			local head, tail = s, ""
-			if cut ~= nil then head = string.sub( s, 1, cut - 1 ); tail = string.sub( s, cut + 1 ) end
-			local fields = split( head, "\2" )
-			local name = fields[ 1 ]
-			local f = R.orig[ name ]
-			if f == nil then f = _G[ name ] end
-			if type( f ) == "function" then
-				local a = { n = table.getn( fields ) - 1 }
-				for m = 2, table.getn( fields ) do a[ m - 1 ] = des( fields[ m ] ) end
-				R.rq = split( tail, "\2" )
-				R.rqi = 0
-				R.depth = 1
-				local ok, err = pcall( f, unpack( a ) )
-				R.depth = 0
-				if R.rqi ~= table.getn( R.rq ) then
-					print( "\1Clog\2replay " .. tostring( name ) .. ": " .. R.rqi .. " query(ies) here, " .. table.getn( R.rq ) .. " on the host" )
-				end
-				R.rq = nil
-				if not ok then print( "\1Clog\2replay " .. tostring( name ) .. " failed: " .. tostring( err ) ) end
+			-- Native C++ player-object event originated by an unpatched chara script on host.
+			if string.sub( s, 1, 3 ) == "\1N\2" then
+				print( "\1Cexec\2" .. s )
 			else
-				print( "\1Clog\2replay: no handler " .. tostring( name ) )
+				local cut = string.find( s, "\3", 1, 1 )
+				local head, tail = s, ""
+				if cut ~= nil then head = string.sub( s, 1, cut - 1 ); tail = string.sub( s, cut + 1 ) end
+				local fields = split( head, "\2" )
+				local name = fields[ 1 ]
+				local f = R.orig[ name ]
+				if f == nil then f = _G[ name ] end
+				if type( f ) == "function" then
+					local a = { n = table.getn( fields ) - 1 }
+					for m = 2, table.getn( fields ) do a[ m - 1 ] = des( fields[ m ] ) end
+					R.rq = split( tail, "\2" )
+					R.rqi = 0
+					R.depth = 1
+					print( "\1Chbeg" )
+					local ok, err = pcall( f, unpack( a ) )
+					print( "\1Chend" )
+					R.depth = 0
+					if R.rqi ~= table.getn( R.rq ) then
+						print( "\1Clog\2replay " .. tostring( name ) .. ": " .. R.rqi .. " query(ies) here, " .. table.getn( R.rq ) .. " on the host" )
+					end
+					R.rq = nil
+					if not ok then print( "\1Clog\2replay " .. tostring( name ) .. " failed: " .. tostring( err ) ) end
+				else
+					print( "\1Clog\2replay: no handler " .. tostring( name ) )
+				end
 			end
 		end
 		SetTimerWithHandler( eventOperation, %(timer)d, 0.1, "__CoopPoll" )
@@ -316,7 +341,7 @@ end
 if __COOP_RT.role == "host" or __COOP_RT.role == "join" then
 	for _, n in ipairs( { %(names)s } ) do __COOP_RT.wrap( n ) end
 	__COOP_RT.install_initial()
-	print( "Clogqueries: " .. __COOP_RT.wrapq_globals() .. " global function(s)" )
+	print( "\1Clog\2queries: " .. __COOP_RT.wrapq_globals() .. " global function(s)" )
 end
 -- ===== end of the co-op runtime =====
 '''

@@ -31,8 +31,8 @@ constexpr uint8_t kTypePad = 1;
 constexpr uint8_t kTypeTransform = 2;
 constexpr uint8_t kTypeSnapshot = 3;
 constexpr size_t kHeader = 8;
-constexpr size_t kPadLen = kHeader + 13;
-constexpr size_t kTransformLen = kHeader + 2 + 4 * (3 + 9 + 3) + 12;  // + AP, AP max, look pitch
+constexpr size_t kPadLen = kHeader + 17;  // + 4 bytes reliable rising-edge latch (edge_seq, edge_buttons)
+constexpr size_t kTransformLen = kHeader + 2 + 4 * (3 + 9 + 3) + 12 + 25;  // + AP/pitch + self AP/PA + peer PA + flags
 constexpr size_t kMaxDatagram = 1200;  // the largest snapshot datagram (research\26 M2)
 constexpr double kPadTimeout = 1.0;    // seconds without a packet: port 1 goes neutral
 constexpr double kPeerTimeout = 5.0;   // seconds without any packet: link considered down (survives load stalls)
@@ -48,6 +48,8 @@ struct PadPacket {
   uint16_t buttons;
   int16_t lx, ly, rx, ry;
   uint8_t lt, rt, port;
+  uint16_t edge_seq;      // increments on every 0->1 button transition; repeated 4 frames so brief taps survive drops
+  uint16_t edge_buttons;  // rising-edge bits for edge_seq (switch weapon, purge, OB, AA, etc.)
 };
 struct TransformPacket {
   int16_t mission_tag;
@@ -56,6 +58,10 @@ struct TransformPacket {
   float velocity[3];
   float ap, apmax;    // AP of the AC the sender simulates for the peer (research\27)
   float pitch;        // local player look pitch in radians (NaN if unavailable)
+  float self_ap, self_apmax;  // sender's own AC1 AP (for partner HUD)
+  float peer_pa, peer_pamax;  // sender's AC2 PA (host -> join authoritative PA)
+  float self_pa, self_pamax;  // sender's own AC1 PA (for partner HUD)
+  uint8_t flags;              // bit 0: sender local_paused
 };
 // Type 3: one snapshot, split over datagrams. `tag` carries the host's entity-pool base so the join
 // can log both bases beside each other; `counter` counts whole snapshots.
@@ -76,8 +82,8 @@ struct SnapshotRecordWire {
 };
 #pragma pack(pop)
 static_assert(sizeof(Header) == 8, "8-byte header");
-static_assert(sizeof(PadPacket) == 13, "pad payload");
-static_assert(sizeof(TransformPacket) == 2 + 4 * 15 + 12, "transform payload");
+static_assert(sizeof(PadPacket) == 17, "pad payload");
+static_assert(sizeof(TransformPacket) == 2 + 4 * 15 + 12 + 25, "transform payload");
 static_assert(sizeof(SnapshotPayload) == 12, "snapshot payload header");
 static_assert(sizeof(SnapshotRecordWire) == 64, "snapshot record");
 static_assert(kHeader + sizeof(SnapshotPayload) + 18 * sizeof(SnapshotRecordWire) <= kMaxDatagram,
@@ -116,10 +122,17 @@ std::atomic<uint32_t> g_snap_counter{0}, g_snap_tag{0};
 std::vector<rt::game::coopnet::SnapshotRecord> g_snap_in;  // received, drained by take_snapshot()
 
 uint16_t g_pad_seq = 0, g_xform_seq = 0, g_snap_seq = 0;
+uint16_t g_tx_prev_buttons = 0, g_tx_edge_seq = 0, g_tx_edge_bits = 0;
+int g_tx_edge_ttl = 0;
+uint16_t g_rx_edge_seq = 0, g_rx_edge_bits = 0;
+int g_rx_edge_ttl = 0;
 float g_local_pos[3] = {};
 float g_local_rot[9] = {};
 float g_local_vel[3] = {};
 float g_local_ap = 0.0f, g_local_apmax = 0.0f;
+float g_local_peer_pa = 0.0f, g_local_peer_pamax = 0.0f;
+float g_local_self_ap = 0.0f, g_local_self_apmax = 0.0f;
+float g_local_self_pa = 0.0f, g_local_self_pamax = 0.0f;
 std::atomic<float> g_local_pitch{NAN};
 int g_mission_tag = 0;
 double g_last_report = -1e9;
@@ -269,6 +282,11 @@ void receive_all() {
         g_pad.ry = p.ry;
         g_pad.lt = p.lt;
         g_pad.rt = p.rt;
+        if (p.edge_seq && p.edge_seq != g_rx_edge_seq && p.edge_buttons) {
+          g_rx_edge_seq = p.edge_seq;
+          g_rx_edge_bits |= p.edge_buttons;
+          g_rx_edge_ttl = 2;  // guarantee at least 2 game reads see brief rising-edge taps
+        }
       }
       g_last_pad_ms = now_ms();
       g_recv.fetch_add(1, std::memory_order_relaxed);
@@ -291,6 +309,13 @@ void receive_all() {
         g_xform.apmax = t.apmax;
         g_xform.has_pitch = std::isfinite(t.pitch) && std::fabs(t.pitch) <= 1.6f;
         if (g_xform.has_pitch) g_xform.pitch = t.pitch;
+        g_xform.self_ap = t.self_ap;
+        g_xform.self_apmax = t.self_apmax;
+        g_xform.peer_pa = t.peer_pa;
+        g_xform.peer_pamax = t.peer_pamax;
+        g_xform.self_pa = t.self_pa;
+        g_xform.self_pamax = t.self_pamax;
+        g_xform.peer_paused = (t.flags & 1u) != 0;
         ++g_xform.samples;
       }
       g_have_xform = true;
@@ -466,6 +491,10 @@ bool remote_pad(PadState* out) {
   if (!last || now_ms() - last > uint32_t(kPadTimeout * 1000)) return false;
   std::lock_guard lk(g_mu);
   *out = g_pad;
+  if (g_rx_edge_ttl > 0 && g_rx_edge_bits) {
+    out->buttons |= g_rx_edge_bits;
+    if (--g_rx_edge_ttl == 0) g_rx_edge_bits = 0;
+  }
   return true;
 }
 
@@ -484,8 +513,56 @@ void set_local_transform(const float position[3], const float rotation[9], const
 }
 
 void set_local_peer_ap(float ap, float apmax) {
+  std::lock_guard lk(g_mu);
   g_local_ap = ap;
   g_local_apmax = apmax;
+}
+
+void set_local_peer_pa(float pa, float pamax) {
+  std::lock_guard lk(g_mu);
+  g_local_peer_pa = pa;
+  g_local_peer_pamax = pamax;
+}
+
+void set_local_self_vitals(float ap, float apmax, float pa, float pamax) {
+  std::lock_guard lk(g_mu);
+  g_local_self_ap = ap;
+  g_local_self_apmax = apmax;
+  g_local_self_pa = pa;
+  g_local_self_pamax = pamax;
+}
+
+PartnerVitals partner_vitals() {
+  PartnerVitals v{};
+  if (!active()) return v;
+  v.peer_up = peer_present();
+  if (!rt::game::coopsession::linked_in_mission()) return v;
+  std::lock_guard lk(g_mu);
+  if (g_have_xform.load(std::memory_order_relaxed) &&
+      uint16_t(g_xform.mission_tag) == rt::game::coopsession::epoch()) {
+    v.paused = g_xform.peer_paused;
+  }
+  if (g_host) {
+    // Host is authoritative for Join's AC (its local body2).
+    if (g_local_apmax >= 1000.0f && std::isfinite(g_local_ap)) {
+      v.ap = g_local_ap;
+      v.apmax = g_local_apmax;
+      v.pa = (g_local_peer_pamax > 100.0f && std::isfinite(g_local_peer_pa)) ? g_local_peer_pa : 0.0f;
+      v.pamax = (g_local_peer_pamax > 100.0f && std::isfinite(g_local_peer_pamax)) ? g_local_peer_pamax : 0.0f;
+      v.valid = true;
+    }
+  } else if (g_have_xform.load(std::memory_order_relaxed) &&
+             uint16_t(g_xform.mission_tag) == rt::game::coopsession::epoch()) {
+    // Join reads Host's authoritative self vitals from TransformPacket.
+    if (g_xform.self_apmax >= 1000.0f && std::isfinite(g_xform.self_ap)) {
+      v.ap = g_xform.self_ap;
+      v.apmax = g_xform.self_apmax;
+      v.pa = (g_xform.self_pamax > 100.0f && std::isfinite(g_xform.self_pa)) ? g_xform.self_pa : 0.0f;
+      v.pamax = (g_xform.self_pamax > 100.0f && std::isfinite(g_xform.self_pamax)) ? g_xform.self_pamax : 0.0f;
+      v.valid = true;
+    }
+  }
+  return v;
 }
 
 void set_local_pitch(float pitch) {
@@ -570,6 +647,19 @@ void frame(const PadState&) {
   if (!rt::game::coopsession::linked_in_mission() || paused) local = PadState{};  // neutral outside a mission or while paused
   const uint64_t f = g_frames.fetch_add(1, std::memory_order_relaxed) + 1;
 
+  // Detect any 0->1 digital button transition and repeat it in PadPacket for 4 frames (~66 ms)
+  // so single-frame taps (Switch Weapon, Purge, OB, Assault Armor) survive isolated UDP drops.
+  const uint16_t rising = uint16_t(local.buttons & ~g_tx_prev_buttons);
+  g_tx_prev_buttons = local.buttons;
+  if (rising) {
+    if (++g_tx_edge_seq == 0) g_tx_edge_seq = 1;
+    g_tx_edge_bits = rising;
+    g_tx_edge_ttl = 4;
+  } else if (g_tx_edge_ttl > 0) {
+    --g_tx_edge_ttl;
+    if (g_tx_edge_ttl == 0) g_tx_edge_bits = 0;
+  }
+
   PadPacket p{};
   p.buttons = local.buttons;
   p.lx = local.lx;
@@ -579,6 +669,8 @@ void frame(const PadState&) {
   p.lt = local.lt;
   p.rt = local.rt;
   p.port = 0;
+  p.edge_seq = g_tx_edge_ttl > 0 ? g_tx_edge_seq : 0;
+  p.edge_buttons = g_tx_edge_ttl > 0 ? g_tx_edge_bits : 0;
   send_packet(kTypePad, ++g_pad_seq, &p, sizeof p);
 
   if (f % uint64_t(kTransformEvery) == 0 || just_unpaused) {
@@ -587,9 +679,19 @@ void frame(const PadState&) {
     std::memcpy(t.position, g_local_pos, sizeof t.position);
     std::memcpy(t.rotation, g_local_rot, sizeof t.rotation);
     if (!paused) std::memcpy(t.velocity, g_local_vel, sizeof t.velocity);
-    t.ap = g_local_ap;
-    t.apmax = g_local_apmax;
+    {
+      std::lock_guard lk(g_mu);
+      t.ap = g_local_ap;
+      t.apmax = g_local_apmax;
+      t.self_ap = g_local_self_ap;
+      t.self_apmax = g_local_self_apmax;
+      t.peer_pa = g_local_peer_pa;
+      t.peer_pamax = g_local_peer_pamax;
+      t.self_pa = g_local_self_pa;
+      t.self_pamax = g_local_self_pamax;
+    }
     t.pitch = g_local_pitch.load(std::memory_order_relaxed);
+    t.flags = paused ? 1u : 0u;
     send_packet(kTypeTransform, ++g_xform_seq, &t, sizeof t);
   }
   flush_delayed_sends();

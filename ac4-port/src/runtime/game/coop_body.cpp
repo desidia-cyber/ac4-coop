@@ -43,6 +43,8 @@ constexpr u32 kBodyId = 4;       // entity id
 constexpr u32 kBodyVt = 0;
 constexpr u32 kBodyAp = 0x2a4;   // current AP/HP (measured, research\26 s1)
 constexpr u32 kBodyApMax = 0x2a8;
+constexpr u32 kBodyPa = 0x2d4;     // current Primal Armor (f_00a53998 / f_00a569f0: body+724)
+constexpr u32 kBodyPaMax = 0x334;  // max Primal Armor (f_00a53998 / f_00a569f0: body+820)
 
 std::atomic<u32> g_body[3];  // [1] the local player, [2] the second AC
 std::atomic<u32> g_obj[3];
@@ -216,10 +218,13 @@ void maybe_apply_spawn_offset(u32 b1, u32 b2) {
   const double dx = double(p2[0]) - p1[0], dy = double(p2[1]) - p1[1], dz = double(p2[2]) - p1[2];
   if (dx * dx + dy * dy + dz * dz < 4.0) {
     const u32 shift = rt::game::coopnet::role_join() ? b1 : b2;
-    constexpr double kOffset = 10.0;
-    const double nx = ppu::rf32(shift + 0x40) + double(rot[0]) * kOffset;
-    const double ny = ppu::rf32(shift + 0x44) + double(rot[1]) * kOffset;
-    const double nz = ppu::rf32(shift + 0x48) + double(rot[2]) * kOffset;
+    // Compact echelon wingman offset (+5.0 right, -3.0 back = ~5.8 units total clearance):
+    // half the lateral footprint of +10.0 so P2 stays safely inside tight corridors/elevators/platforms.
+    constexpr double kRightOffset = 5.0;
+    constexpr double kBackOffset = -3.0;
+    const double nx = ppu::rf32(shift + 0x40) + double(rot[0]) * kRightOffset + double(rot[6]) * kBackOffset;
+    const double ny = ppu::rf32(shift + 0x44) + double(rot[1]) * kRightOffset + double(rot[7]) * kBackOffset;
+    const double nz = ppu::rf32(shift + 0x48) + double(rot[2]) * kRightOffset + double(rot[8]) * kBackOffset;
     wf32(shift + 0x40, nx);
     wf32(shift + 0x44, ny);
     wf32(shift + 0x48, nz);
@@ -229,8 +234,8 @@ void maybe_apply_spawn_offset(u32 b1, u32 b2) {
     wf32(shift + 0xf0, nx);
     wf32(shift + 0xf4, ny);
     wf32(shift + 0xf8, nz);
-    LOG_I("coop", "COOP SPAWN: shifted %s 0x%08x +%.1f right -> (%.1f, %.1f, %.1f)",
-          rt::game::coopnet::role_join() ? "join body1" : "host body2", shift, kOffset, nx, ny, nz);
+    LOG_I("coop", "COOP SPAWN: shifted %s 0x%08x +%.1f right/%.1f back -> (%.1f, %.1f, %.1f)",
+          rt::game::coopnet::role_join() ? "join body1" : "host body2", shift, kRightOffset, kBackOffset, nx, ny, nz);
   }
 }
 
@@ -299,17 +304,32 @@ void net_frame() {
     }
   }
 
-  // The AP of the AC this instance simulates FOR the peer (AC2). On the host that is the join
-  // player, so the host's damage model is authoritative for the join's own AC (research\27).
-  if (b2_now && rt::vm::committed(b2_now + kBodyApMax, 4))
+  // Publish this instance's OWN AC1 AP & PA (for Partner HUD on the peer).
+  if (b1 && rt::vm::committed(b1 + kBodyApMax, 4)) {
+    const float ap1 = float(ppu::rf32(b1 + kBodyAp));
+    const float apm1 = float(ppu::rf32(b1 + kBodyApMax));
+    float pa1 = 0.0f, pam1 = 0.0f;
+    if (rt::vm::committed(b1 + kBodyPaMax, 4)) {
+      pa1 = float(ppu::rf32(b1 + kBodyPa));
+      pam1 = float(ppu::rf32(b1 + kBodyPaMax));
+    }
+    rt::game::coopnet::set_local_self_vitals(ap1, apm1, pa1, pam1);
+  }
+
+  // The AP & PA of the AC this instance simulates FOR the peer (AC2). On the host that is the join
+  // player, so the host's damage & Primal Armor model is authoritative for the join's own AC1.
+  if (b2_now && rt::vm::committed(b2_now + kBodyApMax, 4)) {
     rt::game::coopnet::set_local_peer_ap(float(ppu::rf32(b2_now + kBodyAp)), float(ppu::rf32(b2_now + kBodyApMax)));
+    if (rt::vm::committed(b2_now + kBodyPaMax, 4))
+      rt::game::coopnet::set_local_peer_pa(float(ppu::rf32(b2_now + kBodyPa)), float(ppu::rf32(b2_now + kBodyPaMax)));
+  }
 
   rt::game::coopnet::PadState pad;
   rt::game::coopnet::remote_pad(&pad);   // the pad itself reaches the game through sys_io's port 1
   rt::game::coopnet::frame(pad);
 
-  // What to apply: the peer's AC1 drives this instance's AC2; the host's AP for this player's AC
-  // (its AC2) drives the join's own AC1.
+  // What to apply: the peer's AC1 drives this instance's AC2; the host's AP & PA for this player's AC
+  // (its AC2) drive the join's own AC1.
   const u32 b2 = rt::game::coop_body(2);
   rt::game::coopnet::Transform t;
   if (!rt::game::coopnet::remote_transform(&t)) return;
@@ -322,6 +342,14 @@ void net_frame() {
       LOG_I("coop", "COOP AP: join AC1 0x%08x %.2f -> %.2f (host-authoritative, max %.2f)", b1, double(before),
             double(t.ap), double(t.apmax));
       last_ap = t.ap;
+    }
+  }
+  if (rt::game::coopnet::role_join() && b1 && t.peer_pamax > 100.0f && std::isfinite(t.peer_pa) &&
+      t.peer_pa >= 0.0f && t.peer_pa <= t.peer_pamax * 1.5f && rt::vm::committed(b1 + kBodyPaMax, 4)) {
+    const float local_pamax = float(ppu::rf32(b1 + kBodyPaMax));
+    if (local_pamax > 100.0f) {
+      const float clamped = t.peer_pa > local_pamax ? local_pamax : t.peer_pa;
+      ppu::wf32(b1 + kBodyPa, clamped);
     }
   }
   if (!b2 || !g_pos.any) return;

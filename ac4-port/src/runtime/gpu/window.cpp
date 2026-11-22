@@ -481,6 +481,10 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
       }
+      if (wp == VK_F8 && !repeat && !overlay && !input_isolated()) {
+        ui::toggle_coop_hud();
+        return 0;
+      }
       if (dialog) {
         sysdlg::on_key(u32(wp), true, repeat);
         return 0;  // keys pressed in a system dialog never reach the game

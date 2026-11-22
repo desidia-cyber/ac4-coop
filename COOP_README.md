@@ -34,13 +34,15 @@ Double-click **`play_coop_join.bat`** and enter the Host's IP address (or run `.
 2. **Host-Led Mission Selection:** The **Host** picks any chapter, mission, and difficulty (Normal or Hard) and accepts it.
    - The **Joiner** automatically launches that exact same mission and difficulty — even if the joiner's own save has not unlocked that chapter yet.
 3. **Real Partner AC Designs:** At the load barrier before the mission starts, both players automatically exchange their full 7,680-byte AC schematics (parts, weapons, tuning, paint, emblems) and load the partner's actual AC into the sortie (`ac_1`).
-4. **Synchronized Start & Wing-to-Wing Spawn:** Both games wait at a load barrier until both players finish loading, then start the mission together with Player 2 spawned 10 units to the right of Player 1.
+4. **Synchronized Start & Wing-to-Wing Spawn:** Both games wait at a load barrier until both players finish loading, then start the mission together with Player 2 spawned in a compact echelon formation (`+5 m` right, `-3 m` back) so both ACs clear tight indoor corridors and platforms.
+   - If your partner disconnects during loading, the barrier times out cleanly after 20 s (or hold **ESC** for 1.5 s to start solo immediately).
 5. **Gameplay & Combat:**
-   - The **Host** is authoritative for all enemies, mission timers, dialogue, scripted events, and both players' AP/damage.
-   - The **Joiner's** controller/keyboard inputs drive Player 2's AC on the Host, while the Host streams enemy transforms/HP and scripted mission handlers back to the Joiner.
-   - All **39 campaign mission scripts** (`m000`–`m490`, `m650`, `m710`) are patched in `payload\overlay_coop`:
-     - If **either** player dies or leaves the mission area (`OnDeadPlayer`, `OnOutOfMissionArea`, `OnOutOfRegionAndTimeOut`), the mission fails for both players together.
-     - Mission hazards (PA disable, altitude damage, PA supply) and region triggers (`ObserveRegionExist`, `ObserveRegionIn`, `WatchEntityDistNearInfinity`) apply to both players.
+   - The **Host** is authoritative for all enemies, mission timers, dialogue, scripted events, and both players' **AP & Primal Armor (PA)**.
+   - The **Joiner's** controller/keyboard inputs drive Player 2's AC on the Host (with automatic control-scheme sync so Host and Joiner can freely use different in-game `TYPE A` / `TYPE B` / `CUSTOM` layouts, plus reliable rising-edge button delivery for Weapon Switch/Purge/OB/AA), while the Host streams delta-culled enemy transforms/HP, instant reinforcement discovery, and scripted mission handlers back to the Joiner.
+   - **Partner AP/PA HUD:** During gameplay, a compact top-left overlay shows your partner's live AP and Primal Armor bars (press **`F8`** to toggle).
+   - All **39 campaign mission scripts** (`m000`–`m490`, `m650`, `m710`) are patched in `payload\overlay_coop`, **and** mission-ending calls from unpatched character scripts (`m080`, `m090`, `m200`, `m210`, `m220`, `m280`, `m380`, `m000`, `m010`, `m170`, `m310`) are replicated directly at the engine layer:
+     - If **either** player dies or leaves the mission area (`OnDeadPlayer`, `mXXX_player.lua` death on Normal/Hard, `OnOutOfMissionArea`, `OnOutOfRegionAndTimeOut`), the mission fails cleanly for both players together.
+     - Mission hazards (PA disable, altitude damage, PA supply), region triggers (`ObserveRegionExist`, `ObserveRegionIn`, `WatchEntityDistNearInfinity`, `GetDistEntityPair`), and `GetApRateOfAC` rank/dialogue checks apply across both players.
 6. **Debriefing & Next Mission:** When the mission succeeds (or fails), both players proceed through Debriefing, earn rewards/rank on their own saves, return to the hub, and can immediately launch the next mission for as many consecutive missions as desired.
 
 ---
@@ -50,8 +52,8 @@ Double-click **`play_coop_join.bat`** and enter the Host's IP address (or run `.
 - **Firewall / NAT:** All co-op traffic uses a single UDP port (default `7777`). If the title bar stays on `connecting to the host...`, check Windows Firewall or use Tailscale/ZeroTier.
 - **Pause & Unpause:** Pressing `START` opens your local pause menu without pausing your partner's game (`START`/`SELECT` are masked on the remote pad so you never pause each other). When you unpause, your position and enemy state resync automatically with zero desync.
 - **Mission Failed / Retry:** On `MISSION FAILED`, both players return cleanly to the Mission Select hub with the failed mission still selected so the Host can immediately re-sortie.
-- **Host aborts mid-mission:** If the Host pauses and quits back to the hub while the Joiner is still in the mission, the Joiner's window title displays `host returned to the hub (pause and quit to rejoin)`. Pause and quit to return to the hub and sync up for the next mission.
-- **Partner on Minimap:** Your partner appears as a persistent, live-tracked green ally dot on the radar whenever they are within radar range (including while stationary at `0 km/h`).
+- **Host aborts or restarts mid-mission:** If the Host pauses and quits back to the hub — or clicks **Retry** — while the Joiner is still in the mission, an on-screen HUD banner and window title prompt the Joiner to pause and Retry or Quit to rejoin cleanly.
+- **Partner on Minimap & HUD:** Your partner appears as a persistent, live-tracked green ally dot on the radar whenever they are within radar range (including while stationary at `0 km/h`), plus a live **Partner AP/PA** bar in the top-left corner (`F8` to hide/show).
 - **New Game Prologue (`m160` *First Strike*):** After creating a callsign and playing/skipping the VR tutorial, the Host reaches Chapter 1 Hub (`FIRST STRIKE`) and can launch it directly in co-op with a Joiner on any chapter save.
 - **Building from Source:**
   1. Prepare your own *Armored Core 4* (`BLUS30027`, disc 01.01) data and run the recompiler using `ac4-port`'s build scripts (`ac4-port\README.md`), passing `--hooks src/runtime/game/hooks.txt` to `ac4-recomp emit`.

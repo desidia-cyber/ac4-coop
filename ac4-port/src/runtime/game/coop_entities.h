@@ -45,4 +45,7 @@ size_t coop_entity_addrs(u32* out, size_t max);
 // A new sortie: forget the previous mission's pool window, slot list and interpolation targets.
 void coop_entities_reset();
 
+// Instant 1-frame discovery of newly spawned actors/reinforcements from hook_actor_update / hook_xform_blit.
+void coop_entities_note_live(u32 addr);
+
 }  // namespace rt::game

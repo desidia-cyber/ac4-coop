@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ppu/ppu_recomp.h"
@@ -371,6 +372,9 @@ bool g_pool_dumped = false;
 std::vector<u32> g_ent_addr;        // all occupied entities, ascending
 std::vector<u32> g_nonplayer_addr;  // non-player entities only, ascending (for heap-shift-safe ordinal matching)
 std::unordered_map<u32, u32> g_id_unique;  // entity_id -> addr when unique (0 = ambiguous/shared id)
+std::unordered_set<u32> g_known_set;       // fast O(1) membership check for instant reinforcement discovery
+std::mutex g_live_mu;
+std::vector<u32> g_pending_live;           // newly seen actor addresses from hook_actor_update/hook_xform_blit
 u32 g_ent_lowest = 0;         // diagnostic: the lowest entity address of the last walk
 
 void take_entity(std::vector<Ent>& out, u32 a) {
@@ -438,6 +442,11 @@ void entity_walk() {
   g_ent_addr.clear();
   g_nonplayer_addr.clear();
   g_id_unique.clear();
+  {
+    std::lock_guard lk(g_live_mu);
+    g_known_set.clear();
+    for (const auto& e : ents) g_known_set.insert(e.obj);
+  }
   const u32 b1 = rt::game::coop_body(1), b2 = rt::game::coop_body(2);
   for (const auto& e : ents) {
     g_ent_addr.push_back(e.obj);
@@ -497,6 +506,50 @@ struct Target {
 };
 std::unordered_map<u32, Target> g_targets;
 
+struct SentState {
+  float pos[3] = {};
+  float rot[9] = {};
+  float hp = -1.0f;
+  uint8_t dead_sends = 0;
+  double last_t = -1e9;
+};
+std::unordered_map<u32, SentState> g_sent;
+
+void drain_pending_live() {
+  std::vector<u32> fresh;
+  {
+    std::lock_guard lk(g_live_mu);
+    if (g_pending_live.empty()) return;
+    fresh.swap(g_pending_live);
+  }
+  bool added = false;
+  for (u32 a : fresh) {
+    if (a < kEntAddrFloor || !rt::vm::committed(a + kEntHpMax + 4, 4) || r32(a) != kActorVt) continue;
+    auto it = std::lower_bound(g_ent_addr.begin(), g_ent_addr.end(), a);
+    if (it != g_ent_addr.end() && *it == a) continue;
+    g_ent_addr.insert(it, a);
+    if (g_pool_lo == 0 || a < g_pool_lo) g_pool_lo = a;
+    if (a + kEntHpMax + 4 > g_pool_hi) g_pool_hi = a + kEntHpMax + 4;
+    added = true;
+  }
+  if (!added) return;
+  g_nonplayer_addr.clear();
+  g_id_unique.clear();
+  const u32 b1 = rt::game::coop_body(1), b2 = rt::game::coop_body(2);
+  for (u32 a : g_ent_addr) {
+    if (!rt::vm::committed(a + kEntHpMax + 4, 4) || r32(a) != kActorVt) continue;
+    const u32 eid = r32(a + kEntId);
+    if (a != b1 && a != b2 && eid != 1000u && eid != 1001u) {
+      g_nonplayer_addr.push_back(a);
+      if (eid != 0) {
+        auto [it, ins] = g_id_unique.emplace(eid, a);
+        if (!ins) it->second = 0;
+      }
+    }
+  }
+  g_ent_lowest = g_ent_addr.empty() ? 0 : g_ent_addr.front();
+}
+
 void snapshot_publish() {
   if (!rt::game::coopnet::role_host() || g_ent_addr.empty()) return;
   const double now = rt::log_time();
@@ -519,15 +572,42 @@ void snapshot_publish() {
     for (int row = 0; row < 3; ++row)
       for (int c = 0; c < 3; ++c) r.rotation[row * 3 + c] = float(ppu::rf32(a + kEntRot + 16 * row + 4 * c));
     r.hp = float(ppu::rf32(a + kEntHp));
+
+    // Bandwidth culling: send immediately when moving, rotating, damaged, or newly dead (5x);
+    // stationary / long-dead entities refresh at ~1 Hz heartbeat (~70-90% UDP savings).
+    const bool dead = std::isfinite(r.hp) && r.hp <= 0.0f;
+    auto it = g_sent.find(a);
+    bool send_now = (it == g_sent.end());
+    if (!send_now) {
+      const SentState& s = it->second;
+      if (dead) {
+        send_now = (s.dead_sends < 5) || (now - s.last_t >= 1.0);
+      } else {
+        const float dx = r.position[0] - s.pos[0], dy = r.position[1] - s.pos[1], dz = r.position[2] - s.pos[2];
+        float dr = 0.0f;
+        for (int k = 0; k < 9; ++k) dr = std::max(dr, std::fabs(r.rotation[k] - s.rot[k]));
+        const bool moved = (dx * dx + dy * dy + dz * dz) > (0.05f * 0.05f);
+        const bool turned = dr > 0.005f;
+        const bool hp_chg = std::fabs(r.hp - s.hp) > 0.01f;
+        send_now = moved || turned || hp_chg || (now - s.last_t >= 1.0);
+      }
+    }
+    if (!send_now) continue;
+    SentState& s = g_sent[a];
+    std::memcpy(s.pos, r.position, sizeof s.pos);
+    std::memcpy(s.rot, r.rotation, sizeof s.rot);
+    s.hp = r.hp;
+    s.dead_sends = dead ? (s.dead_sends < 250 ? uint8_t(s.dead_sends + 1) : 250) : 0;
+    s.last_t = now;
     recs.push_back(r);
   }
-  const size_t pk = rt::game::coopnet::send_snapshot(recs.data(), recs.size(), g_ent_lowest);
+  const size_t pk = recs.empty() ? 0 : rt::game::coopnet::send_snapshot(recs.data(), recs.size(), g_ent_lowest);
   g_sent_sec += recs.size();
   g_pkts_sec += pk;
   if (now - g_last_snap_log < 1.0) return;
   g_last_snap_log = now;
-  LOG_I("coop", "COOP SNAP host t=%.1f sent %llu records in %llu datagrams (%zu entity(s) excluding the 2 players, lowest 0x%08x)",
-        now, (unsigned long long)g_sent_sec, (unsigned long long)g_pkts_sec, recs.size(), g_ent_lowest);
+  LOG_I("coop", "COOP SNAP host t=%.1f sent %llu records in %llu datagrams (%zu/%u active entity(s), lowest 0x%08x)",
+        now, (unsigned long long)g_sent_sec, (unsigned long long)g_pkts_sec, recs.size(), unsigned(ord), g_ent_lowest);
   g_sent_sec = g_pkts_sec = 0;
 }
 
@@ -666,9 +746,15 @@ void coop_entities_reset() { g_reset_req = true; }  // done on the frame thread 
 
 void do_reset() {
   g_targets.clear();
+  g_sent.clear();
   g_ent_addr.clear();
   g_nonplayer_addr.clear();
   g_id_unique.clear();
+  {
+    std::lock_guard lk(g_live_mu);
+    g_known_set.clear();
+    g_pending_live.clear();
+  }
   g_pool_lo = g_pool_hi = 0;
   g_pool_dumped = false;
   g_last_rescan = -1e9;
@@ -676,13 +762,21 @@ void do_reset() {
   LOG_I("coop", "COOP ENT: reset for a new sortie");
 }
 
+void coop_entities_note_live(u32 addr) {
+  if (addr < kEntAddrFloor || !rt::vm::committed(addr + kEntHpMax + 4, 4)) return;
+  if (r32(addr) != kActorVt) return;
+  std::lock_guard lk(g_live_mu);
+  if (g_known_set.insert(addr).second) g_pending_live.push_back(addr);
+}
+
 void coop_entities_frame() {
   if (!coop_entities_on()) return;
   if (g_reset_req.exchange(false)) do_reset();
+  drain_pending_live();  // 1-frame discovery for newly spawned reinforcements/bosses
   poll_requests();
   snapshot_ingest();   // join: update the interpolation table from anything that arrived
   snapshot_apply();    // join: re-assert every entity's host transform this frame
-  snapshot_publish();  // host: ~10 Hz, from the slot list the walk keeps current
+  snapshot_publish();  // host: ~10 Hz, delta/idle-culled from the live entity list
   const double now = rt::log_time();
   if (now - g_last_walk < 1.0) return;
   g_last_walk = now;

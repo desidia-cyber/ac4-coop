@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace ppu {
 struct Context;
@@ -62,5 +63,8 @@ void note_scene_init();
 constexpr size_t kAcDesignBytes = 7680;
 void set_local_ac_design(const uint8_t* data, size_t len);
 bool get_peer_ac_design(uint8_t* out, size_t len);
+
+// Short status banner for the Direct2D co-op HUD overlay (empty when nothing needs attention).
+std::string hud_banner();
 
 }  // namespace rt::game::coopsession

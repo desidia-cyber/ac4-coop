@@ -19,12 +19,17 @@
 #include "runtime/game/coop_net.h"
 #include "runtime/game/coop_session.h"
 #include "runtime/game/frame_policy.h"
+#include "runtime/game/key_assign.h"
 #include "runtime/gpu/window.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
 
 void f_002a0bd4(ppu::Ctx&);  // lua_pushlstring(L, s, len)
 void f_007cca94(ppu::Ctx&);  // the mission screen's sortie start (hooked: sortie_start)
+void f_00b0e4d8(ppu::Ctx&);  // SetMissionResult (vtable 0x101463c0 slot 0x88)
+void f_00b0e2e4(ppu::Ctx&);  // SetMissionEndingFlowCAPEvent (vtable 0x101463c0 slot 0x3c)
+void f_00b0ebe0(ppu::Ctx&);  // SetMissionMode (vtable 0x101463c0 slot 0x100)
+void f_00b0e718(ppu::Ctx&);  // SetEnableImmortal (vtable 0x101463c0 slot 0x114)
 
 namespace {
 
@@ -86,6 +91,8 @@ struct LobbyWire {
   uint32_t key;          // the sortie start's arguments (key_encode), 0 = none
   uint32_t ev_ack;       // join: the highest event seq received contiguously
   uint32_t ev_count;     // host: events published in this epoch
+  uint8_t keys_valid;    // 1 when keys[19] holds this player's live control table (TYPE A/B/CUSTOM)
+  uint8_t keys[19];      // rt::game::kSlotCount (operator +60 / +80)
 };
 struct EventWire {
   uint16_t epoch;
@@ -100,6 +107,7 @@ struct DesignWire {
   uint16_t reserved;
 };
 #pragma pack(pop)
+static_assert(rt::game::kSlotCount == 19, "LobbyWire keys[] matches kSlotCount");
 
 std::mutex g_mu;
 
@@ -115,6 +123,8 @@ double g_autostart_at = -1e9, g_idle_since = -1;
 constexpr u32 kPlayerObjVt = 0x101463c0u;
 std::atomic<u32> g_player_obj[3] = {0, 0, 0};
 std::atomic<uint16_t> g_kill_epoch{0};  // test aid: the epoch whose success stopped the autokill
+std::atomic<int> g_lua_handler_depth{0};  // >0 while inside a wrapped mXXX.lua handler (host or join replay)
+thread_local bool t_in_native_exec = false;
 bool g_autostart_pending = false;
 u32 g_autostart_flow = 0, g_autostart_key = 0;
 uint16_t g_epoch_counter = 0;
@@ -126,6 +136,8 @@ struct Peer {
   uint16_t design_mask = 0;
   uint32_t key = 0;
   uint32_t ev_ack = 0, ev_count = 0;
+  bool keys_valid = false;
+  uint8_t keys[19] = {};
   double at = -1e9;
 } g_peer;
 
@@ -165,6 +177,11 @@ void send_lobby() {
   w.mission = g_mission.load();
   w.epoch = g_epoch.load();
   w.key = g_key.load();
+  u8 local_keys[rt::game::kSlotCount] = {};
+  if (rt::game::key_assignment(local_keys)) {
+    w.keys_valid = 1;
+    std::memcpy(w.keys, local_keys, sizeof w.keys);
+  }
   {
     std::lock_guard lk(g_mu);
     w.design_mask = (g_peer_design_epoch == w.epoch) ? g_peer_design_mask : 0;
@@ -173,6 +190,34 @@ void send_lobby() {
   }
   net::send_raw(kTypeLobby, &w, sizeof w);
   g_last_lobby = now_s();
+}
+
+// Sync partner's in-game control scheme (TYPE A / TYPE B / CUSTOM, 19 slots) onto P2's pad
+// operator (+60 and +80, matching f_00b5129c_guest), so players can use different control types.
+void sync_peer_key_assignment() {
+  const u32 op = rt::game::coop_p2_operator();
+  if (!op || !rt::vm::committed(op + 60, 40)) return;
+  uint8_t pkeys[19] = {};
+  {
+    std::lock_guard lk(g_mu);
+    if (!g_peer.keys_valid) return;
+    std::memcpy(pkeys, g_peer.keys, sizeof pkeys);
+  }
+  bool diff = false;
+  for (u32 i = 0; i < 19; ++i) {
+    if (r8(op + 80 + i) != pkeys[i] || r8(op + 60 + i) != pkeys[i]) {
+      diff = true;
+      break;
+    }
+  }
+  if (!diff) return;
+  for (u32 i = 0; i < 19; ++i) {
+    ppu::w8(op + 60 + i, pkeys[i]);
+    ppu::w8(op + 80 + i, pkeys[i]);
+  }
+  std::string s;
+  for (u32 i = 0; i < 19; ++i) s += ac4::strprintf(" %02x", pkeys[i]);
+  LOG_I("coop", "COOP INPUT: applied partner control scheme to P2 operator 0x%08x:%s", op, s.c_str());
 }
 
 void send_missing_design_chunks() {
@@ -258,6 +303,9 @@ void update_title() {
     s += host() ? "- waiting for the partner to connect" : "- connecting to the host...";
   } else if (join() && g_phase.load() == cs::kPlaying && p.phase == cs::kMenu) {
     s += "- host returned to the hub (pause and quit to rejoin)";
+  } else if (join() && g_phase.load() == cs::kPlaying && (p.phase == cs::kSortie || p.phase == cs::kBarrier) &&
+             p.epoch && p.epoch != g_epoch.load()) {
+    s += "- host restarted the mission (pause -> Retry or Quit to rejoin)";
   } else if (join() && g_phase.load() == cs::kMenu && p.phase >= cs::kSortie && p.epoch && p.epoch == g_join_played) {
     s += "- mission over here; the host is still finishing it";
   } else if (join() && g_phase.load() == cs::kMenu && p.phase == cs::kPlaying && p.epoch) {
@@ -342,11 +390,111 @@ int lua_return_string(ppu::Ctx& ctx, u32 L, const std::string& s) {
   return 1;
 }
 
+// Replays a host-originated native player-object call (from an unpatched mXXX_mission.000 chara
+// script: SetMissionResult, SetMissionEndingFlowCAPEvent, SetMissionMode, SetEnableImmortal) onto
+// both local per-player objects (p1 and p2) on a clean PPC64 stack frame.
+void call_player_obj_method(ppu::Ctx& ctx, u32 obj, u32 slot_off, void (*fn)(ppu::Ctx&), u32 a4, u32 a5) {
+  if (!obj || !rt::vm::committed(obj, 4) || r32(obj) != kPlayerObjVt) return;
+  const u32 vt = r32(obj);
+  if (!rt::vm::committed(vt + slot_off, 4)) return;
+  const u32 opd = r32(vt + slot_off);
+  if (!opd || !rt::vm::committed(opd, 8)) return;
+  const u32 toc = r32(opd + 4);
+  const u32 sp = u32(ctx.r[1]);
+  const u32 new_sp = (sp - 160u) & ~15u;
+  if (!rt::vm::committed(new_sp, 160)) return;
+  u64 saved_r[13];
+  for (int i = 0; i < 13; ++i) saved_r[i] = ctx.r[i];
+  const u64 saved_lr = ctx.lr, saved_ctr = ctx.ctr, saved_cia = ctx.cia;
+  ppu::w64(new_sp, sp);
+  ppu::w64(new_sp + 40, ctx.r[2]);
+  ctx.r[1] = new_sp;
+  ctx.r[2] = toc;
+  ctx.r[3] = obj;
+  ctx.r[4] = a4;
+  ctx.r[5] = a5;
+  ctx.lr = 0;
+  t_in_native_exec = true;
+  fn(ctx);
+  t_in_native_exec = false;
+  for (int i = 0; i < 13; ++i) ctx.r[i] = saved_r[i];
+  ctx.lr = saved_lr;
+  ctx.ctr = saved_ctr;
+  ctx.cia = saved_cia;
+}
+
+void exec_native_player_event(ppu::Ctx& ctx, const std::string& payload) {
+  // payload format: "\1N\2<kind>\2<a4>\2<a5>"
+  if (payload.size() < 4 || payload[0] != '\1' || payload[1] != 'N' || payload[2] != '\2') return;
+  const size_t p1 = payload.find('\2', 3);
+  if (p1 == std::string::npos) return;
+  const size_t p2 = payload.find('\2', p1 + 1);
+  if (p2 == std::string::npos) return;
+  const std::string kind = payload.substr(3, p1 - 3);
+  const u32 a4 = u32(std::strtoul(payload.substr(p1 + 1, p2 - p1 - 1).c_str(), nullptr, 10));
+  const u32 a5 = u32(std::strtoul(payload.substr(p2 + 1).c_str(), nullptr, 10));
+  void (*fn)(ppu::Ctx&) = nullptr;
+  u32 slot = 0;
+  if (kind == "res") {
+    fn = f_00b0e4d8;
+    slot = 0x88;
+  } else if (kind == "end") {
+    fn = f_00b0e2e4;
+    slot = 0x3c;
+  } else if (kind == "mode") {
+    fn = f_00b0ebe0;
+    slot = 0x100;
+  } else if (kind == "imm") {
+    fn = f_00b0e718;
+    slot = 0x114;
+  } else {
+    return;
+  }
+  const u32 obj1 = g_player_obj[1].load(std::memory_order_relaxed);
+  const u32 obj2 = g_player_obj[2].load(std::memory_order_relaxed);
+  LOG_W("coop", "COOP NATIVE join replays %s(r4=%u, r5=%u) on p1=0x%08x p2=0x%08x", kind.c_str(), a4, a5, obj1, obj2);
+  if (obj1) call_player_obj_method(ctx, obj1, slot, fn, a4, a5);
+  if (obj2 && obj2 != obj1) call_player_obj_method(ctx, obj2, slot, fn, a4, a5);
+}
+
+void publish_native_event(const char* kind, u32 a4, u32 a5) {
+  if (!host()) return;
+  const uint16_t ep = g_epoch.load();
+  if (!ep) return;
+  const std::string msg = ac4::strprintf("\1N\2%s\2%u\2%u", kind, a4, a5);
+  uint32_t seq = 0;
+  {
+    std::lock_guard lk(g_mu);
+    // Avoid duplicate consecutive identical native events (e.g. if both bodies fire in the same tick).
+    if (!g_events.empty() && g_events.back() == msg) return;
+    g_events.push_back(msg);
+    seq = uint32_t(g_events.size());
+    g_sent_upto = seq;
+    ++g_events_sec;
+  }
+  if (seq) send_event(ep, seq, msg);
+  if (std::strcmp(kind, "res") == 0 && a4 == 1u) g_kill_epoch = ep;
+  LOG_W("coop", "COOP NATIVE host #%u epoch %u: %s(r4=%u, r5=%u) [chara script]", seq, ep, kind, a4, a5);
+}
+
 int lua_command(ppu::Ctx& ctx, u32 L, const std::string& cmd) {
   // cmd is the text after "\1C".
   const size_t sep = cmd.find('\2');
   const std::string verb = cmd.substr(0, sep);
   const std::string rest = sep == std::string::npos ? std::string() : cmd.substr(sep + 1);
+  if (verb == "hbeg") {
+    g_lua_handler_depth.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+  }
+  if (verb == "hend") {
+    if (g_lua_handler_depth.fetch_sub(1, std::memory_order_relaxed) <= 0)
+      g_lua_handler_depth.store(0, std::memory_order_relaxed);
+    return 0;
+  }
+  if (verb == "exec") {
+    exec_native_player_event(ctx, rest);
+    return 0;
+  }
   if (verb == "role") {
     if (!net::active()) return 0;
     return lua_return_string(ctx, L, host() ? "host" : "join");
@@ -622,6 +770,7 @@ void autostart_after_frame(ppu::Ctx& ctx) {
 void reset_mission_objects() {
   g_player_obj[1].store(0, std::memory_order_relaxed);
   g_player_obj[2].store(0, std::memory_order_relaxed);
+  g_lua_handler_depth.store(0, std::memory_order_relaxed);
 }
 
 void note_scene_init() {
@@ -716,6 +865,10 @@ void on_packet(uint8_t type, const uint8_t* p, size_t n) {
     g_peer.key = w.key;
     g_peer.ev_ack = w.ev_ack;
     g_peer.ev_count = w.ev_count;
+    if (w.keys_valid) {
+      std::memcpy(g_peer.keys, w.keys, sizeof g_peer.keys);
+      g_peer.keys_valid = true;
+    }
     g_peer.at = now_s();
     if (changed)
       LOG_I("coop", "COOP SESSION: partner is now %s, mission %03u record 0x%08x epoch %u", phase_name(w.phase), w.mission,
@@ -780,6 +933,7 @@ void frame() {
     g_last_resend = t;
     resend_events();
   }
+  sync_peer_key_assignment();
   phase_watchdog();
   update_title();
   if (t - g_last_stat > 5.0) {
@@ -800,6 +954,27 @@ void frame() {
   }
 }
 
+std::string hud_banner() {
+  if (!net::active()) return {};
+  const Phase ph = Phase(g_phase.load());
+  if (ph == kBarrier) {
+    return net::peer_present()
+               ? "CO-OP LOAD BARRIER - WAITING FOR PARTNER  (HOLD ESC TO START SOLO)"
+               : "CO-OP LOAD BARRIER - PARTNER DISCONNECTED  (HOLD ESC OR WAIT 20S TO START SOLO)";
+  }
+  if (ph != kPlaying) return {};
+  if (!net::peer_present()) return "PARTNER CONNECTION LOST - RECONNECTING...";
+  Peer p;
+  {
+    std::lock_guard lk(g_mu);
+    p = g_peer;
+  }
+  if (join() && p.phase == kMenu) return "HOST RETURNED TO HUB - PAUSE & QUIT TO REJOIN";
+  if (join() && (p.phase == kSortie || p.phase == kBarrier) && p.epoch && p.epoch != g_epoch.load())
+    return "HOST RESTARTED MISSION - PAUSE -> RETRY OR QUIT TO REJOIN";
+  return {};
+}
+
 void load_barrier() {
   if (!net::active()) return;
   if (g_phase.load() == kMenu) {
@@ -811,8 +986,10 @@ void load_barrier() {
   const double t0 = now_s();
   LOG_W("coop", "COOP BARRIER: mission %03u (record 0x%08x) epoch %u loaded; waiting for the partner", g_mission.load(),
         g_key.load(), g_epoch.load());
+  bool ever_seen = net::peer_present();
   double last_seen = t0;
   double both_at = -1.0;
+  double esc_since = -1.0;
   for (;;) {
     net::pump();
     const uint16_t ep = g_epoch.load();  // a join that came first adopts the host's epoch meanwhile
@@ -830,11 +1007,25 @@ void load_barrier() {
       if (both_at < 0.0) both_at = t;
       if (designs_done || (t - both_at > 5.0)) break;
     }
-    if (net::peer_present()) last_seen = t;
-    // A loading partner sends nothing while its main thread is busy (the lobby goes out from the frame
-    // hook), so silence alone is only fatal after a long time.
-    if (t - last_seen > 300.0) {
-      LOG_E("coop", "COOP BARRIER: no packet from the partner for 300 s; starting without them");
+    if (net::peer_present()) {
+      ever_seen = true;
+      last_seen = t;
+    }
+    // Hold ESC for 1.5 s to cancel waiting at the load barrier and start solo cleanly.
+    if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) {
+      if (esc_since < 0.0) esc_since = t;
+      if (t - esc_since >= 1.5) {
+        LOG_W("coop", "COOP BARRIER: user held ESC for 1.5 s; cancelling barrier and starting solo");
+        break;
+      }
+    } else {
+      esc_since = -1.0;
+    }
+    // Smart timeout: if partner was connected and dropped out completely, give them 20 s (survives
+    // brief load stalls) instead of freezing for 5 minutes; if never connected yet, wait up to 120 s.
+    const double timeout_s = ever_seen ? 20.0 : 120.0;
+    if (t - last_seen > timeout_s) {
+      LOG_E("coop", "COOP BARRIER: no packet from the partner for %.0f s; starting without them", timeout_s);
       break;
     }
     if (t - g_last_lobby > 0.05) send_lobby();
@@ -1047,15 +1238,45 @@ static void player_redirect(Ctx& ctx, void (*orig)(Ctx&), const char* what) {
   }
   orig(ctx);
 }
+// Replicates mission-ending player calls originated by unpatched mXXX_mission.000 chara scripts
+// (e.g. m080/m090/m200/m210/m220/m280/m380 player death, m010_rocket failure, m000_ac/joshua
+// victory, m170/m310 endings) from host -> join over the reliable event stream, and blocks local
+// unpatched chara scripts from unilaterally ending the joiner's mission.
+static void native_event_gate(Ctx& ctx, void (*orig)(Ctx&), const char* kind, const char* what, bool block_on_join) {
+  if (!t_in_native_exec && rt::game::coopsession::linked_in_mission() &&
+      g_lua_handler_depth.load(std::memory_order_relaxed) == 0) {
+    const u32 a4 = u32(ctx.r[4]), a5 = u32(ctx.r[5]);
+    const bool replicate = (std::strcmp(kind, "mode") != 0) || (a5 == 0);
+    if (replicate) {
+      if (join() && block_on_join) {
+        static std::atomic<int> blocked{0};
+        if (blocked.fetch_add(1, std::memory_order_relaxed) < 20)
+          LOG_W("coop", "COOP NATIVE: blocked local chara-script %s(r4=%u, r5=%u) on join (waiting for host)", what, a4, a5);
+        return;
+      }
+      if (host()) publish_native_event(kind, a4, a5);
+    }
+  }
+  player_redirect(ctx, orig, what);
+}
+
 void hook_player_cap(Ctx& ctx, void (*orig)(Ctx&)) { player_redirect(ctx, orig, "SetMissionCAPEvent"); }
-void hook_player_ending(Ctx& ctx, void (*orig)(Ctx&)) { player_redirect(ctx, orig, "SetMissionEndingFlowCAPEvent"); }
-void hook_player_mode(Ctx& ctx, void (*orig)(Ctx&)) { player_redirect(ctx, orig, "SetMissionMode"); }
-void hook_player_immortal(Ctx& ctx, void (*orig)(Ctx&)) { player_redirect(ctx, orig, "SetEnableImmortal"); }
+void hook_player_ending(Ctx& ctx, void (*orig)(Ctx&)) {
+  native_event_gate(ctx, orig, "end", "SetMissionEndingFlowCAPEvent", true);
+}
+void hook_player_mode(Ctx& ctx, void (*orig)(Ctx&)) {
+  native_event_gate(ctx, orig, "mode", "SetMissionMode", true);
+}
+void hook_player_immortal(Ctx& ctx, void (*orig)(Ctx&)) {
+  native_event_gate(ctx, orig, "imm", "SetEnableImmortal", false);
+}
 // Slot 0x88 (invoker 0x15cef3f0 holds slot+1 = 0x89, read at run time in s28z). Without it the host's
 // SetMissionResult(SUCCESS/FAILURE) only reached player 2's object, so the host's own mission never
 // had a result and its ending stayed on black (s28t, s28y) while the join, which replays the event
 // through copy 1, reached the debriefing.
-void hook_player_result(Ctx& ctx, void (*orig)(Ctx&)) { player_redirect(ctx, orig, "SetMissionResult"); }
+void hook_player_result(Ctx& ctx, void (*orig)(Ctx&)) {
+  native_event_gate(ctx, orig, "res", "SetMissionResult", true);
+}
 
 // 0x0074cf88: a scene requests the next scene (r3 the current scene, r4 the next, f1/f2 the fades).
 // Logged so the hub -> mission chain is on record (and the hub scene object is known).
