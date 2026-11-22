@@ -31,6 +31,11 @@
 #include "runtime/log.h"
 #include "runtime/memory.h"
 
+void f_00a4ece4(ppu::Ctx&);  // Actor::OnEvent(entity, type, id, arg, flag), TOC = 0x00ef5c94
+void f_00a5091c(ppu::Ctx&);  // Actor::ApplyDamage(entity, DamageMsg*, flag), TOC = 0x00ef5c94
+void f_00a50cb8(ppu::Ctx&);  // Actor::ApplyDirectDamage(entity, float damage), TOC = 0x00ef5c94
+void f_00a29aac(ppu::Ctx&);  // WeaponSlot::Purge(slot), TOC = 0x00ef5c94
+
 namespace {
 
 using ppu::r32;
@@ -38,7 +43,7 @@ using ppu::rf32;
 using ppu::wf32;
 
 constexpr u32 kHp = 0x2a4;
-constexpr u32 kHpMax = 0x2a8;
+constexpr u32 kGameToc = 0x00ef5c94u;
 
 bool freeze_on() {
   static std::once_flag once;
@@ -117,23 +122,141 @@ void hook_hp_set(Ctx& ctx, void (*orig)(Ctx&)) {
   orig(ctx);
 }
 
-// 0x00a569f0: the other object-field HP writer (the port's earlier scan found exactly two). It is
-// the AC's per-frame HP/PA update: it reads the damage fields around +0x2d4/+0x33c and writes
-// +0x2a4. Logged for the two player bodies, and on the join the player's HP is re-asserted from the
-// host after the update, so a local enemy can never decide the join player's AP.
+void drain_ppu_coop_jobs(Ctx& ctx) {
+  const u32 b1 = rt::game::coop_body(1), b2 = rt::game::coop_body(2);
+  if (!b1 || !b2) return;
+  static thread_local bool in_ppu_jobs = false;
+  if (in_ppu_jobs) return;
+  in_ppu_jobs = true;
+  if (rt::game::coopnet::role_join()) {
+    u32 kills[16];
+    const size_t nk = rt::game::coop_entities_drain_kills(kills, 16);
+    for (size_t i = 0; i < nk; ++i) {
+      const u32 tgt = kills[i];
+      if (tgt < 0x10000000u || tgt == b1 || tgt == b2 || !rt::vm::committed(tgt + 0x2a8, 4)) continue;
+      if (r32(tgt) != 0x10142638u) continue;
+      const u32 eid = r32(tgt + 4);
+      if (eid == 1000u || eid == 1001u) continue;
+      const float cur_hp = float(rf32(tgt + kHp));
+      if (!std::isfinite(cur_hp) || cur_hp <= 0.0f) continue;
+      const Ctx saved = ctx;
+      ctx.r[1] = saved.r[1] - 128u;
+      ctx.r[2] = kGameToc;
+      ctx.r[3] = tgt;
+      ctx.f[1] = double(cur_hp) + 10000.0;
+      f_00a50cb8(ctx);
+      ctx = saved;
+      float after_hp = float(rf32(tgt + kHp));
+      bool via_event = false;
+      if (std::isfinite(after_hp) && after_hp > 0.0f) {
+        // Script-immortal actor (entity+752 != 0) skipped f_00a5091c: dispatch native death event
+        // 0x80020064 (same path as KillEventGroup / f_00b0edfc) so explosions & radar clear run.
+        const u32 arg_sp = u32(saved.r[1]) - 64u;
+        if (rt::vm::committed(arg_sp, 16)) {
+          ppu::w32(arg_sp + 0, 0u);
+          ppu::w32(arg_sp + 4, 0u);
+          ppu::w32(arg_sp + 8, 1u);
+          ppu::w32(arg_sp + 12, 0u);
+          ctx.r[1] = u64(arg_sp) - 128u;
+          ctx.r[2] = kGameToc;
+          ctx.r[3] = tgt;
+          ctx.r[4] = 2u;
+          ctx.r[5] = 0x80020064u;
+          ctx.r[6] = arg_sp;
+          ctx.r[7] = 0u;
+          f_00a4ece4(ctx);
+          ctx = saved;
+          wf32(tgt + kHp, 0.0f);
+          after_hp = 0.0f;
+          via_event = true;
+        }
+      }
+      static std::atomic<uint64_t> kill_logs{0};
+      const uint64_t kl = kill_logs.fetch_add(1, std::memory_order_relaxed);
+      if (kl < 40)
+        LOG_I("coop", "COOP DEATH: native kill 0x%08x (id=%u, hp %.1f -> %.1f%s)", tgt, eid, double(cur_hp),
+              double(after_hp), via_event ? ", via 0x80020064" : "");
+    }
+    rt::game::PartBreakJob parts[8];
+    const size_t nparts = rt::game::coop_entities_drain_part_breaks(parts, 8);
+    for (size_t i = 0; i < nparts; ++i) {
+      const u32 tgt = parts[i].addr;
+      const s32 pid = parts[i].part_id;
+      if (tgt < 0x10000000u || tgt == b1 || tgt == b2 || pid < 0 || pid >= 16) continue;
+      if (!rt::vm::committed(tgt + 0x2b8, 4) || r32(tgt) != 0x10142638u) continue;
+      const u32 beg = r32(tgt + 0x2b0), end = r32(tgt + 0x2b4);
+      if (beg < 0x10000000u || end <= beg || u32(pid) >= ((end - beg) >> 3)) continue;
+      if (!rt::vm::committed(beg + u32(pid) * 8u, 8)) continue;
+      const float pcur = float(rf32(beg + u32(pid) * 8u));
+      if (!std::isfinite(pcur) || pcur <= 0.0f) continue;
+      // Preserve main body HP when breaking a sub-part on a still-living boss/ship so f_00a5091c
+      // cannot prematurely kill the main body before the host does.
+      const float keep_hp = (std::isfinite(parts[i].host_hp) && parts[i].host_hp > 0.0f) ? parts[i].host_hp : 0.0f;
+      if (keep_hp > 0.0f) wf32(tgt + kHp, keep_hp + pcur + 10000.0f);
+      const Ctx saved = ctx;
+      const u32 msg_sp = u32(ctx.r[1]) - 128u;
+      if (rt::vm::committed(msg_sp, 96)) {
+        for (u32 off = 0; off < 64; off += 4) ppu::w32(msg_sp + off, 0u);
+        ppu::w32(msg_sp + 0, 3u);
+        ppu::w32(msg_sp + 4, u32(pid));
+        wf32(msg_sp + 8, pcur + 1000.0f);
+        wf32(msg_sp + 12, 0.0f);
+        if (rt::vm::committed(tgt + 0x40, 12)) {
+          wf32(msg_sp + 16, rf32(tgt + 0x40));
+          wf32(msg_sp + 20, rf32(tgt + 0x44));
+          wf32(msg_sp + 24, rf32(tgt + 0x48));
+        }
+        ctx.r[1] = u64(msg_sp) - 128u;
+        ctx.r[2] = kGameToc;
+        ctx.r[3] = tgt;
+        ctx.r[4] = msg_sp;
+        ctx.r[5] = 0;
+        f_00a5091c(ctx);
+      }
+      ctx = saved;
+      if (keep_hp > 0.0f) wf32(tgt + kHp, keep_hp);
+      LOG_I("coop", "COOP PART: native break 0x%08x (id=%u) part[%d] %.1f -> %.1f", tgt, r32(tgt + 4), pid,
+            double(pcur), double(rf32(beg + u32(pid) * 8u)));
+    }
+  }
+  u32 purges[4];
+  const size_t np = rt::game::coop_body_drain_purges(purges, 4);
+  for (size_t i = 0; i < np; ++i) {
+    const u32 slot = purges[i];
+    if (slot < 0x10000000u || !rt::vm::committed(slot, 20)) continue;
+    const Ctx saved = ctx;
+    ctx.r[1] = saved.r[1] - 128u;
+    ctx.r[2] = kGameToc;
+    ctx.r[3] = slot;
+    f_00a29aac(ctx);
+    ctx = saved;
+    LOG_I("coop", "COOP WPN: executed native purge on slot 0x%08x", slot);
+  }
+  in_ppu_jobs = false;
+}
+
+// 0x00a569f0: PrimalArmorObject::Update(pa_obj, dt), where pa_obj = *(u32*)(body + 712)
+// (vtable 0x10142638 slot +0x64 = f_00a4e798). Reads PA stats at +0x308/+0x334 and updates current
+// PA at +0x2d4. On the join, re-assert the host's authoritative PA/EN/ammo for AC1 right after the
+// local tick, and drain any PPU-thread co-op jobs (native enemy death explosions, weapon purges).
 void hook_hp_update(Ctx& ctx, void (*orig)(Ctx&)) {
   const u32 self = u32(ctx.r[3]);
-  const float before = rt::vm::committed(self + kHp, 4) ? float(rf32(self + kHp)) : 0.0f;
   orig(ctx);
-  const float after = rt::vm::committed(self + kHp, 4) ? float(rf32(self + kHp)) : 0.0f;
-  const bool player = self && (self == rt::game::coop_body(1) || self == rt::game::coop_body(2));
-  if (player && before != after) {
-    static std::atomic<uint64_t> n{0};
-    const uint64_t c = n.fetch_add(1, std::memory_order_relaxed);
-    if (c < 300) LOG_I("coop", "COOP HPU %s 0x%08x %.4f -> %.4f", self == rt::game::coop_body(1) ? "P1" : "P2",
-                       self, double(before), double(after));
-  }
-  if (rt::game::coopnet::role_join() && self == rt::game::coop_body(1)) {
+  const u32 b1 = rt::game::coop_body(1);
+  if (!b1) return;
+  if (rt::vm::committed(b1 + 712, 4) && self == r32(b1 + 712)) {
+    if (rt::game::coopnet::role_join() && rt::vm::committed(self + 824, 4)) {
+      float pa = 0.0f, pamax = 0.0f;
+      if (rt::game::coopnet::peer_pa(&pa, &pamax) && pamax > 1.0f) {
+        const float base = float(rf32(self + 820));
+        const float mult = float(rf32(self + 776));
+        const float local_max = (mult > 0.01f && mult <= 10.0f) ? (base * mult) : base;
+        if (local_max > 1.0f) wf32(self + 724, pa > local_max ? local_max : pa);
+      }
+      rt::game::coop_body_reassert_join_vitals(b1);
+    }
+    drain_ppu_coop_jobs(ctx);
+  } else if (rt::game::coopnet::role_join() && self == b1) {
     float ap = 0.0f, apmax = 0.0f;
     if (rt::game::coopnet::peer_ap(&ap, &apmax) && apmax > 0.0f) wf32(self + kHp, ap);
   }
@@ -171,12 +294,34 @@ void hook_xform_blit(Ctx& ctx, void (*orig)(Ctx&)) {
             (unsigned long long)c);
   }
   // Instant 1-frame actor discovery for newly spawned reinforcements on both host and join.
-  if (rt::game::coopnet::active() && self >= 0x10000000u) rt::game::coop_entities_note_live(self);
+  if (rt::game::coopnet::active() && self >= 0x10000000u) {
+    rt::game::coop_entities_note_live(self);
+    if (rt::vm::committed(self, 8)) {
+      const u32 vt = r32(self);
+      if (vt != 0x10142638u) {
+        static std::mutex vt_mu;
+        static u32 seen_vts[16] = {};
+        static int seen_n = 0;
+        std::lock_guard lk(vt_mu);
+        bool known = false;
+        for (int i = 0; i < seen_n; ++i)
+          if (seen_vts[i] == vt) { known = true; break; }
+        if (!known && seen_n < 16) {
+          seen_vts[seen_n++] = vt;
+          LOG_I("coop", "COOP XBLIT non-actor vtable 0x%08x on obj 0x%08x id=%u caller 0x%08x", vt, self, r32(self + 4),
+                u32(ctx.lr));
+        }
+      }
+    }
+  }
   // The freeze: this blit is what moves the entity's live +0x10 transform. On the join, for every
-  // non-player entity, do not run it once both player ACs are built (during BUILD#1/BUILD#2 both
-  // bodies and initial mission spawns must receive their spawn transforms!).
+  // LIVE non-player entity, do not run it once both player ACs are built (during BUILD#1/BUILD#2
+  // both bodies and initial mission spawns must receive their spawn transforms, and already-dead
+  // entities are allowed through so native death wreckage/collapse animations play cleanly).
   const u32 b1 = rt::game::coop_body(1), b2 = rt::game::coop_body(2);
-  if (freeze_on() && b1 && b2 && self && self != b1 && self != b2 &&
+  if (b1 && b2) drain_ppu_coop_jobs(ctx);
+  const bool entity_alive = !rt::vm::committed(self + kHp, 4) || float(rf32(self + kHp)) > 0.0f;
+  if (freeze_on() && b1 && b2 && self && self != b1 && self != b2 && entity_alive &&
       rt::vm::committed(self, 8) && r32(self) == 0x10142638 &&
       r32(self + 4) != 1000u && r32(self + 4) != 1001u) {
     static std::atomic<uint64_t> n{0};

@@ -23,4 +23,10 @@ bool coop_body_position(int which, double out[3]);
 // A new sortie: the previous mission's bodies are gone.
 void coop_body_reset();
 
+// PPU-thread helpers called from coop_hooks.cpp (60 Hz):
+// Re-asserts Host-authoritative EN and HUD ammo on Joiner's AC1 right after local updates.
+void coop_body_reassert_join_vitals(u32 b1);
+// Drains debounced weapon-purge slot addresses queued for native f_00a29aac(slot) execution.
+size_t coop_body_drain_purges(u32* out_slots, size_t max);
+
 }  // namespace rt::game

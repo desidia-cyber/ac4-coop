@@ -83,10 +83,13 @@ if __COOP_RT == nil then
 					if ok2 and type( r2 ) == "number" and r2 >= 0 and r2 <= 1.01 then
 						r = ( r + r2 ) * 0.5
 					end
-				elseif name == "GetDistEntityPair" and arg[ 2 ] == p1 then
-					local ok2, r2 = pcall( f, arg[ 1 ], 1001, arg[ 3 ] )
-					if ok2 and type( r2 ) == "number" and r2 >= 0 and r2 < r then
-						r = r2
+				elseif name == "GetDistEntityPair" then
+					if arg[ 2 ] == p1 then
+						local ok2, r2 = pcall( f, arg[ 1 ], 1001, arg[ 3 ] )
+						if ok2 and type( r2 ) == "number" and r2 >= 0 and r2 < r then r = r2 end
+					elseif arg[ 3 ] == p1 then
+						local ok2, r2 = pcall( f, arg[ 1 ], arg[ 2 ], 1001 )
+						if ok2 and type( r2 ) == "number" and r2 >= 0 and r2 < r then r = r2 end
 					end
 				end
 			end
@@ -272,6 +275,7 @@ if __COOP_RT == nil then
 					_G[ name ] = function( eo, id, a3, a4, a5 )
 						f( eo, id, a3, a4, a5 )
 						if id == ( ENTITY_ID__PLAYER or 1000 ) then
+							if name == "ON_DEAD_ENTITY" then R.p1_dead_watched = true end
 							print( "\1Clog\2second player watched: " .. name .. " -> " .. tostring( a3 ) )
 							f( eo, P2, a3, a4, a5 )
 						end
@@ -301,6 +305,16 @@ if __COOP_RT == nil then
 			end
 			init( eventOperation )
 			R.eo = eventOperation
+			-- For missions whose mXXX.lua left ON_DEAD_ENTITY(PLAYER) commented out (m080/m090/m200/
+			-- m210/m220/m280/m380, delegating death to mXXX_player.lua): watch both players as a safety
+			-- net on the host (p2wrap2 automatically mirrors ENTITY_ID__PLAYER -> 1001). Because
+			-- mXXX_player.lua fires synchronously before ON_DEAD_ENTITY dispatches, has_result is
+			-- already set if the chara script handled it; otherwise fire MissionFailure_PlayerIsDead
+			-- immediately (do NOT rely on a timer on the dead body's eventOperation).
+			if R.role == "host" and who == "2" and not R.p1_dead_watched and type( ON_DEAD_ENTITY ) == "function" then
+				print( "\1Clog\2fallback death watch installed for P1/P2 (mXXX.lua has no ON_DEAD_ENTITY)" )
+				ON_DEAD_ENTITY( eventOperation, ENTITY_ID__PLAYER or 1000, "__CoopFallbackDead" )
+			end
 			print( "\1Clog\2runtime ready: role " .. tostring( R.role ) .. ", player copy " .. tostring( who ) )
 			if R.role == "join" and who ~= "2" then
 				SetTimerWithHandler( eventOperation, %(timer)d, 0.1, "__CoopPoll" )
@@ -317,7 +331,31 @@ if __COOP_RT == nil then
 			if R.role == "host" and kp ~= nil and ak == nil and who ~= "2" then
 				SetTimerWithHandler( eventOperation, %(killtimer)d, kp, "__CoopKillP2" )
 			end
+			-- test aid (host, AC4_COOP_TEST_KILLP1=<seconds>): kills P1 (host) once to test host-death sync
+			local kp1 = tonumber( print( "\1Cflag\2killp1" ) or "" )
+			if R.role == "host" and kp1 ~= nil and ak == nil and kp == nil and who ~= "2" then
+				SetTimerWithHandler( eventOperation, %(killtimer)d, kp1, "__CoopKillP1" )
+			end
 		end
+	end
+	function __CoopFallbackDead( eventOperation )
+		if R.fallback_fired then return end
+		if print( "\1Cflag\2has_result" ) ~= nil then
+			print( "\1Clog\2fallback death: mission result already set by chara script" )
+			return
+		end
+		R.fallback_fired = true
+		__CoopFallbackFail( eventOperation )
+	end
+	function __CoopFallbackFail( eventOperation )
+		print( "\1Clog\2fallback death: firing MissionFailure_PlayerIsDead" )
+		if type( MissionFailure_PlayerIsDead ) == "function" then
+			MissionFailure_PlayerIsDead( eventOperation, 0 )
+		end
+	end
+	function __CoopKillP1( eventOperation )
+		print( "\1Clog\2killp1: KillEntity 1000" )
+		eventOperation:KillEntity( ENTITY_ID__PLAYER or 1000 )
 	end
 	function __CoopKillP2( eventOperation )
 		print( "\1Clog\2killp2: KillEntity 1001" )
@@ -340,6 +378,7 @@ if __COOP_RT == nil then
 end
 if __COOP_RT.role == "host" or __COOP_RT.role == "join" then
 	for _, n in ipairs( { %(names)s } ) do __COOP_RT.wrap( n ) end
+	__COOP_RT.wrap( "__CoopFallbackFail" )
 	__COOP_RT.install_initial()
 	print( "\1Clog\2queries: " .. __COOP_RT.wrapq_globals() .. " global function(s)" )
 end
@@ -385,6 +424,62 @@ def patch(mid, out_root):
     return names
 
 
+def patch_mission(mid, out_root):
+    """Patch P1-hardcoded AI / boss hooks inside mXXX_mission.000 (solo-safe, gated on print('\\1Crole'))."""
+    src = os.path.join(DISC, mid + "_mission.000")
+    if not os.path.exists(src):
+        return 0
+    orig, entries = T.parse(src)
+    edits = 0
+    for e in entries:
+        name = e["name"].replace("\\", "/")
+        if not name.endswith(".lua"):
+            continue
+        raw = bytes(e["data"])
+        txt = raw.decode("cp932", errors="surrogateescape")
+        new_txt = txt
+        if "/airesource/script/" in name:
+            # m020/m040/m140: drop P1-only force target in co-op so radar targeting engages both players.
+            new_txt, n1 = re.subn(
+                r'Targetting_SetForceTarget\s*\(\s*([^,]+?)\s*,\s*ENTITY_ID__PLAYER\s*\)\s*;?',
+                r'if print("\\1Crole") == nil then Targetting_SetForceTarget(\1, ENTITY_ID__PLAYER); end',
+                new_txt,
+            )
+            # m040_fortress_eye: treat P2 (1001) as a player target too.
+            new_txt, n2 = re.subn(
+                r'ENTITY_ID__PLAYER\s*==\s*GetEntityIdOfTarget\s*\(\s*([^)]+?)\s*\)',
+                r'(ENTITY_ID__PLAYER == GetEntityIdOfTarget(\1) or (print("\\1Crole") ~= nil and 1001 == GetEntityIdOfTarget(\1)))',
+                new_txt,
+            )
+            # m120/m130/m240: match altitude of whichever player (1000 or 1001) this enemy is targeting.
+            new_txt, n3 = re.subn(
+                r'GetEntityAltitude\s*\(\s*([^,]+?)\s*,\s*ENTITY_ID__PLAYER\s*\)',
+                r'GetEntityAltitude(\1, (print("\\1Crole") ~= nil and type(GetEntityIdOfTarget) == "function" and GetEntityIdOfTarget(\1) == 1001 and 1001 or ENTITY_ID__PLAYER))',
+                new_txt,
+            )
+            edits += n1 + n2 + n3
+        elif "/event/mission/obj/m350_" in name:
+            # m350_obj/wall/henden: also watch P2 (1001) so Joiner triggers boss terrain destruction too.
+            new_txt, n4 = re.subn(
+                r'(ctrl:WatchM350PlayerBossEntity\s*\(\s*)ENTITY_ID__PLAYER(\s*,[^;]+;)',
+                r'\1ENTITY_ID__PLAYER\2\r\n\t\tif print("\\1Crole") ~= nil then \g<1>1001\2 end',
+                new_txt,
+                flags=re.S,
+            )
+            edits += n4
+        if new_txt != txt:
+            e["data"] = bytearray(new_txt.encode("cp932", errors="surrogateescape"))
+    if edits == 0:
+        return 0
+    dst_dir = os.path.join(out_root, r"PS3_GAME\USRDIR\bind\world")
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, mid + "_mission.000")
+    with open(dst, "wb") as f:
+        f.write(T.build(orig, entries))
+    print("%s_mission: %d co-op AI/obj edit(s) -> %s" % (mid, edits, dst))
+    return edits
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=OUT)
@@ -393,6 +488,7 @@ def main():
     mids = a.missions or sorted(f[:4] for f in os.listdir(DISC) if re.match(r"m\d{3}_event\.000$", f))
     for mid in mids:
         patch(mid, a.out)
+        patch_mission(mid, a.out)
 
 
 if __name__ == "__main__":

@@ -45,12 +45,21 @@ bool peer_present();
 // pad/transform path; the send itself happens every 6th frame.
 void set_local_transform(const float position[3], const float rotation[9], const float velocity[3], int mission_tag);
 
-// The AP/PA of the AC this instance simulates for the PEER (its AC2). On the host that is the join
-// player, so the join can make the host's AP & PA authoritative for its own AC1 (research\27).
+// The AP/PA/EN/weapons of the AC this instance simulates for the PEER (its AC2). On the host that is
+// the join player, so the host's simulation is authoritative for the join's own AC1 (research\27).
+struct WeaponSyncState {
+  uint8_t active = 0xff;  // low nibble: right active idx (0..3, 0xf=n/a), high nibble: left active idx
+  uint8_t purged = 0;     // bits 0..5: purged flag for wpn_mgr+1072 holders 0..5
+  int16_t ammo[6] = {-1, -1, -1, -1, -1, -1};  // wpn_mgr+556 banks[0..1] slots[0..2] cur_ammo (-1 = n/a)
+};
 void set_local_peer_ap(float ap, float apmax);
 void set_local_peer_pa(float pa, float pamax);
-// The AP/PA of this instance's OWN AC1 (sent to the partner for the Partner AP/PA HUD).
+void set_local_peer_en(float en, float enmax, bool redline);
+void set_local_peer_weapons(const WeaponSyncState& w);
+// The AP/PA & active/purged weapons of this instance's OWN AC1 (sent to the partner for Partner HUD
+// and visual weapon sync on AC2).
 void set_local_self_vitals(float ap, float apmax, float pa, float pamax);
+void set_local_self_weapons(uint8_t active, uint8_t purged);
 // The local player AC's vertical look pitch in radians (from look control +48, so mouse vertical aim
 // replicates to the partner's AC2 even though mouse pitch bypasses the right stick).
 void set_local_pitch(float pitch);
@@ -61,9 +70,13 @@ bool remote_pitch(float* pitch);
 // transform immediately on unpause.
 void note_local_sim_tick();
 bool local_paused();
-// The AP last received for the peer-controlled AC (the host's AC2 on the join). False until a
-// transform packet carrying it has arrived.
+// The AP/PA/EN/weapons last received for the peer-controlled AC (the host's AC2 on the join). False
+// until a transform packet carrying them has arrived.
 bool peer_ap(float* ap, float* apmax);
+bool peer_pa(float* pa, float* pamax);
+bool peer_en(float* en, float* enmax, bool* redline);
+bool peer_weapons(WeaponSyncState* out);
+bool remote_self_weapons(uint8_t* active, uint8_t* purged);
 // Authoritative partner vitals for the co-op HUD (host reads body2 locally; join reads host's self vitals).
 struct PartnerVitals {
   float ap = 0.0f, apmax = 0.0f;
@@ -88,11 +101,12 @@ bool role_join();
 // if that address does not hold an entity on the receiving side.
 struct SnapshotRecord {
   uint32_t addr;
-  uint32_t entity_id;  // stable mission entity id (*(addr + 4)), immune to heap address shifts
-  uint16_t ord;        // rank among non-player entities
+  uint32_t entity_id;     // stable mission entity id (*(addr + 4)), immune to heap address shifts
+  uint16_t ord;           // rank among non-player entities
+  uint16_t broken_parts;  // bitmask of destroyed sub-parts (entity+0x2b0 durability array, cur_hp <= 0)
   float position[3];
-  float rotation[9];  // rows of the body's 4x4 at +0x10/+0x20/+0x30
-  float hp;           // +0x2a4
+  float rotation[9];      // rows of the body's 4x4 at +0x10/+0x20/+0x30
+  float hp;               // +0x2a4
 };
 
 // Host: send `n` records as one snapshot. Returns the number of datagrams sent (0 when not the host).
@@ -125,6 +139,12 @@ struct Transform {
   float peer_pamax = 0.0f;
   float self_pa = 0.0f;
   float self_pamax = 0.0f;
+  float peer_en = 0.0f;   // sender's AC2 EN (host -> join authoritative EN)
+  float peer_enmax = 0.0f;
+  bool peer_en_redline = false;
+  WeaponSyncState peer_wpn{};
+  uint8_t self_wpn_active = 0xff;
+  uint8_t self_wpn_purged = 0;
   bool peer_paused = false;
   uint32_t age_ms = 0;    // milliseconds since this transform sample was received
   uint32_t samples = 0;

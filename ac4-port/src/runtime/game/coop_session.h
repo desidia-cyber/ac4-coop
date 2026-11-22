@@ -66,5 +66,7 @@ bool get_peer_ac_design(uint8_t* out, size_t len);
 
 // Short status banner for the Direct2D co-op HUD overlay (empty when nothing needs attention).
 std::string hud_banner();
+// Push local control scheme (TYPE A/B/CUSTOM) to the partner immediately when first read or changed.
+void note_local_keys_changed();
 
 }  // namespace rt::game::coopsession

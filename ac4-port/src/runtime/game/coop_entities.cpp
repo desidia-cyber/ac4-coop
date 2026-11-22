@@ -501,15 +501,45 @@ struct Target {
   float cur_pos[3] = {};
   float cur_rot[9] = {};
   float hp = 0.0f;
+  uint16_t broken_parts = 0;
+  uint16_t queued_parts = 0;
   double t_prev = 0.0, t_cur = 0.0;
   bool have = false, have_prev = false;
+  bool death_queued = false;
+  double death_t = -1e9;
 };
 std::unordered_map<u32, Target> g_targets;
+std::mutex g_kill_mu;
+std::vector<u32> g_pending_kills;
+std::vector<rt::game::PartBreakJob> g_pending_parts;
+uint64_t g_kills_queued_total = 0;
+std::mutex g_dead_mu;
+std::unordered_set<u32> g_host_dead;
+uint64_t g_host_dead_logs = 0;
+
+// Reads entity+672+12 sub-part durability vector (f_00b76ecc: begin at +0x2b0, end at +0x2b4,
+// 8 bytes per part: { float cur_hp, float max_hp }). Returns bitmask of parts with cur_hp <= 0.
+uint16_t read_broken_parts(u32 addr) {
+  if (!rt::vm::committed(addr + 0x2b8, 4)) return 0;
+  const u32 beg = r32(addr + 0x2b0);
+  const u32 end = r32(addr + 0x2b4);
+  if (beg < 0x10000000u || end <= beg || ((end - beg) & 7u) != 0) return 0;
+  const u32 cnt = (end - beg) >> 3;
+  if (cnt == 0 || cnt > 16 || !rt::vm::committed(beg, end - beg)) return 0;
+  uint16_t mask = 0;
+  for (u32 p = 0; p < cnt; ++p) {
+    const float cur = float(ppu::rf32(beg + p * 8u));
+    const float maxv = float(ppu::rf32(beg + p * 8u + 4u));
+    if (std::isfinite(maxv) && maxv > 0.0f && std::isfinite(cur) && cur <= 0.0f) mask |= uint16_t(1u << p);
+  }
+  return mask;
+}
 
 struct SentState {
   float pos[3] = {};
   float rot[9] = {};
   float hp = -1.0f;
+  uint16_t broken_parts = 0;
   uint8_t dead_sends = 0;
   double last_t = -1e9;
 };
@@ -572,8 +602,13 @@ void snapshot_publish() {
     for (int row = 0; row < 3; ++row)
       for (int c = 0; c < 3; ++c) r.rotation[row * 3 + c] = float(ppu::rf32(a + kEntRot + 16 * row + 4 * c));
     r.hp = float(ppu::rf32(a + kEntHp));
+    {
+      std::lock_guard lk(g_dead_mu);
+      if (g_host_dead.count(a) != 0) r.hp = 0.0f;
+    }
+    r.broken_parts = read_broken_parts(a);
 
-    // Bandwidth culling: send immediately when moving, rotating, damaged, or newly dead (5x);
+    // Bandwidth culling: send immediately when moving, rotating, damaged, sub-part broken, or newly dead (5x);
     // stationary / long-dead entities refresh at ~1 Hz heartbeat (~70-90% UDP savings).
     const bool dead = std::isfinite(r.hp) && r.hp <= 0.0f;
     auto it = g_sent.find(a);
@@ -581,7 +616,7 @@ void snapshot_publish() {
     if (!send_now) {
       const SentState& s = it->second;
       if (dead) {
-        send_now = (s.dead_sends < 5) || (now - s.last_t >= 1.0);
+        send_now = (s.dead_sends < 5) || (r.broken_parts != s.broken_parts) || (now - s.last_t >= 1.0);
       } else {
         const float dx = r.position[0] - s.pos[0], dy = r.position[1] - s.pos[1], dz = r.position[2] - s.pos[2];
         float dr = 0.0f;
@@ -589,7 +624,8 @@ void snapshot_publish() {
         const bool moved = (dx * dx + dy * dy + dz * dz) > (0.05f * 0.05f);
         const bool turned = dr > 0.005f;
         const bool hp_chg = std::fabs(r.hp - s.hp) > 0.01f;
-        send_now = moved || turned || hp_chg || (now - s.last_t >= 1.0);
+        const bool part_chg = (r.broken_parts != s.broken_parts);
+        send_now = moved || turned || hp_chg || part_chg || (now - s.last_t >= 1.0);
       }
     }
     if (!send_now) continue;
@@ -597,6 +633,7 @@ void snapshot_publish() {
     std::memcpy(s.pos, r.position, sizeof s.pos);
     std::memcpy(s.rot, r.rotation, sizeof s.rot);
     s.hp = r.hp;
+    s.broken_parts = r.broken_parts;
     s.dead_sends = dead ? (s.dead_sends < 250 ? uint8_t(s.dead_sends + 1) : 250) : 0;
     s.last_t = now;
     recs.push_back(r);
@@ -654,6 +691,7 @@ void snapshot_ingest() {
     std::memcpy(t.cur_pos, recs[i].position, sizeof t.cur_pos);
     std::memcpy(t.cur_rot, recs[i].rotation, sizeof t.cur_rot);
     t.hp = recs[i].hp;
+    t.broken_parts = recs[i].broken_parts;
     t.t_cur = now;
     t.have = true;
     ++g_apply_sec;
@@ -696,13 +734,40 @@ void snapshot_apply() {
     }
 
     // Write both live (+0x10/+0x40) and controller-source (+0x190/+0x1c0) transforms so active AI
-    // on the join aims/fires from the host's exact position. When host reports hp <= 0, collapse the
-    // 3x3 rotation rows to 0 (matching AC4's native dead-entity convention) so corpses vanish cleanly.
+    // on the join aims/fires from the host's exact position. When host reports hp <= 0, queue a
+    // native kill (f_00a50cb8 on the PPU thread) instead of silently zeroing HP & collapsing the
+    // rotation matrix on frame 0 — that triggers AC4's full explosion VFX, debris, and SFX.
     const bool dead = std::isfinite(t.hp) && t.hp <= 0.0f;
     const bool have_copy4 = rt::vm::committed(addr + 0x190, 0x40);
+    if (dead) {
+      const float local_hp = float(ppu::rf32(addr + kEntHp));
+      if (!t.death_queued) {
+        t.death_queued = true;
+        t.death_t = now;
+        if (std::isfinite(local_hp) && local_hp > 0.0f) {
+          std::lock_guard lk(g_kill_mu);
+          g_pending_kills.push_back(addr);
+          ++g_kills_queued_total;
+          continue;  // leave live transform intact 1 frame so explosion spawns at exact world position
+        }
+      }
+      if (!std::isfinite(local_hp) || local_hp <= 0.0f) {
+        continue;  // native death/explosion/wreck animation is running cleanly; don't stomp it
+      }
+      if (now - t.death_t < 1.5) continue;  // waiting for PPU thread to run f_00a50cb8
+      // Safety fallback only if an immortal/un-killable actor still has local_hp > 0 after 1.5 s:
+      for (int row = 0; row < 3; ++row)
+        for (int c = 0; c < 3; ++c) {
+          ppu::wf32(addr + kEntRot + 16 * row + 4 * c, 0.0f);
+          if (have_copy4) ppu::wf32(addr + 0x190 + 16 * row + 4 * c, 0.0f);
+        }
+      ppu::wf32(addr + kEntHp, 0.0f);
+      continue;
+    }
+    t.death_queued = false;
     for (int row = 0; row < 3; ++row)
       for (int c = 0; c < 3; ++c) {
-        const float v = dead ? 0.0f : t.cur_rot[row * 3 + c];
+        const float v = t.cur_rot[row * 3 + c];
         ppu::wf32(addr + kEntRot + 16 * row + 4 * c, v);
         if (have_copy4) ppu::wf32(addr + 0x190 + 16 * row + 4 * c, v);
       }
@@ -711,14 +776,30 @@ void snapshot_apply() {
       if (have_copy4) ppu::wf32(addr + 0x1c0 + 4 * k, pos[k]);
     }
     ppu::wf32(addr + kEntHp, t.hp);
+    // Multi-part boss/ship sub-part destruction sync (entity+0x2b0 durability array):
+    // when Host breaks sub-part p and Joiner's part p is still intact, queue native f_00a5091c.
+    if (t.broken_parts) {
+      const uint16_t local_broken = read_broken_parts(addr);
+      const uint16_t missing = uint16_t(t.broken_parts & ~local_broken & ~t.queued_parts);
+      if (missing) {
+        std::lock_guard lk(g_kill_mu);
+        for (int p = 0; p < 16; ++p) {
+          if (missing & (1u << p)) {
+            t.queued_parts |= uint16_t(1u << p);
+            g_pending_parts.push_back({addr, s32(p), t.hp});
+          }
+        }
+      }
+    }
   }
   if (now - g_last_snap_log < 1.0) return;
   g_last_snap_log = now;
   const double mean_err = g_err_n_sec ? g_err_sum_sec / double(g_err_n_sec) : 0.0;
-  LOG_I("coop", "COOP SNAP join t=%.1f applied %llu rec (total %llu), skipped %llu, counter %u, host lowest 0x%08x vs local 0x%08x, pre-apply error mean %.2f max %.2f at 0x%08x, %zu live target(s)%s",
+  LOG_I("coop", "COOP SNAP join t=%.1f applied %llu rec (total %llu), skipped %llu, counter %u, host lowest 0x%08x vs local 0x%08x, pre-apply error mean %.2f max %.2f at 0x%08x, %zu live target(s), kills_q=%llu%s",
         now, (unsigned long long)g_apply_sec, (unsigned long long)g_apply_total, (unsigned long long)g_skip_sec,
         g_seen_counter, rt::game::coopnet::snapshot_tag(), g_ent_lowest, mean_err, g_maxerr_sec, g_worst_addr_sec,
-        g_targets.size(), g_nosnap.load() ? " [AC4_COOP_NOSNAP=1: received, NOT applied]" : "");
+        g_targets.size(), (unsigned long long)g_kills_queued_total,
+        g_nosnap.load() ? " [AC4_COOP_NOSNAP=1: received, NOT applied]" : "");
   g_apply_sec = g_skip_sec = 0;
   g_maxerr_sec = 0;
   g_err_sum_sec = 0;
@@ -755,6 +836,17 @@ void do_reset() {
     g_known_set.clear();
     g_pending_live.clear();
   }
+  {
+    std::lock_guard lk(g_kill_mu);
+    g_pending_kills.clear();
+    g_pending_parts.clear();
+  }
+  {
+    std::lock_guard lk(g_dead_mu);
+    g_host_dead.clear();
+    g_host_dead_logs = 0;
+  }
+  g_kills_queued_total = 0;
   g_pool_lo = g_pool_hi = 0;
   g_pool_dumped = false;
   g_last_rescan = -1e9;
@@ -767,6 +859,37 @@ void coop_entities_note_live(u32 addr) {
   if (r32(addr) != kActorVt) return;
   std::lock_guard lk(g_live_mu);
   if (g_known_set.insert(addr).second) g_pending_live.push_back(addr);
+}
+
+void coop_entities_note_dead(u32 addr) {
+  if (addr < kEntAddrFloor || !rt::vm::committed(addr + kEntHpMax + 4, 4)) return;
+  if (r32(addr) != kActorVt) return;
+  const u32 b1 = rt::game::coop_body(1), b2 = rt::game::coop_body(2);
+  const u32 eid = r32(addr + kEntId);
+  if (addr == b1 || addr == b2 || eid == 1000u || eid == 1001u) return;
+  std::lock_guard lk(g_dead_mu);
+  if (g_host_dead.insert(addr).second && g_host_dead_logs < 30) {
+    ++g_host_dead_logs;
+    LOG_I("coop", "COOP ENT: host death event 0x%08x (id=%u, hp=%.1f)", addr, eid, double(ppu::rf32(addr + kEntHp)));
+  }
+}
+
+size_t coop_entities_drain_kills(u32* out, size_t max) {
+  if (!out || !max) return 0;
+  std::lock_guard lk(g_kill_mu);
+  const size_t n = g_pending_kills.size() < max ? g_pending_kills.size() : max;
+  for (size_t i = 0; i < n; ++i) out[i] = g_pending_kills[i];
+  g_pending_kills.erase(g_pending_kills.begin(), g_pending_kills.begin() + std::ptrdiff_t(n));
+  return n;
+}
+
+size_t coop_entities_drain_part_breaks(PartBreakJob* out, size_t max) {
+  if (!out || !max) return 0;
+  std::lock_guard lk(g_kill_mu);
+  const size_t n = g_pending_parts.size() < max ? g_pending_parts.size() : max;
+  for (size_t i = 0; i < n; ++i) out[i] = g_pending_parts[i];
+  g_pending_parts.erase(g_pending_parts.begin(), g_pending_parts.begin() + std::ptrdiff_t(n));
+  return n;
 }
 
 void coop_entities_frame() {

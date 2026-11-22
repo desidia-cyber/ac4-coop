@@ -22,6 +22,7 @@
 #include "runtime/game/coop_body.h"
 #include "runtime/game/coop_build.h"
 #include "runtime/game/coop_net.h"
+#include "runtime/game/coop_session.h"
 #include "runtime/game/create_hooks.h"
 #include "runtime/game/key_assign.h"
 #include "runtime/game/menu_mouse.h"
@@ -151,14 +152,19 @@ void note_key_table(Ctx& ctx) {
     codes[i] = r8(table + i);
     if (codes[i] > 0x17 && codes[i] < 0xfe) return;  // not an action table
   }
-  std::lock_guard lk(g_keys_mu);
-  if (!g_keys_known || std::memcmp(codes, g_keys, sizeof codes) != 0) {
-    std::string s;
-    for (u8 c : codes) s += ac4::strprintf(" %02x", c);
-    LOG_I("input", "the game's button assignment (action table 0x%08x):%s", table, s.c_str());
+  bool changed = false;
+  {
+    std::lock_guard lk(g_keys_mu);
+    if (!g_keys_known || std::memcmp(codes, g_keys, sizeof codes) != 0) {
+      std::string s;
+      for (u8 c : codes) s += ac4::strprintf(" %02x", c);
+      LOG_I("input", "the game's button assignment (action table 0x%08x):%s", table, s.c_str());
+      changed = true;
+    }
+    std::memcpy(g_keys, codes, sizeof codes);
+    g_keys_known = true;
   }
-  std::memcpy(g_keys, codes, sizeof codes);
-  g_keys_known = true;
+  if (changed) rt::game::coopsession::note_local_keys_changed();
 }
 bool keys(u8 codes[::rt::game::kSlotCount]) {
   std::lock_guard lk(g_keys_mu);

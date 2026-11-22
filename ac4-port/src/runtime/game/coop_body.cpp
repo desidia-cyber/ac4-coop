@@ -26,6 +26,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "runtime/game/coop_build.h"
 #include "runtime/game/coop_net.h"
@@ -41,10 +42,304 @@ using ppu::wf32;
 constexpr u32 kDumpBytes = 0x200;  // past body+0x1b0 (the rotation row 2 input_hooks.cpp reads) and +0x1e4
 constexpr u32 kBodyId = 4;       // entity id
 constexpr u32 kBodyVt = 0;
-constexpr u32 kBodyAp = 0x2a4;   // current AP/HP (measured, research\26 s1)
+constexpr u32 kBodyAp = 0x2a4;     // current AP/HP (measured, research\26 s1)
 constexpr u32 kBodyApMax = 0x2a8;
-constexpr u32 kBodyPa = 0x2d4;     // current Primal Armor (f_00a53998 / f_00a569f0: body+724)
-constexpr u32 kBodyPaMax = 0x334;  // max Primal Armor (f_00a53998 / f_00a569f0: body+820)
+constexpr u32 kBodyAcObj = 708;    // body+0x2c4: AC controller object (f_009acafc)
+constexpr u32 kBodyPaObj = 712;    // body+0x2c8: PrimalArmorObject* (vtable 0x10142638 slot +0x64 = f_00a4e798)
+constexpr u32 kPaObjCur = 724;     // pa_obj+0x2d4: current PA (f_00a53350 / f_00a53998 / f_00a569f0)
+constexpr u32 kPaObjMult = 776;    // pa_obj+0x308: PA max multiplier (f_00a539ec)
+constexpr u32 kPaObjMax = 820;     // pa_obj+0x334: base max PA (f_00a53178)
+constexpr u32 kAcWpnMgr = 204;     // ac+0xcc: WeaponManager* (f_009acafc, f_00a19f08)
+constexpr u32 kAcEnObj = 208;      // ac+0xd0: embedded Generator/EN sub-object (f_00686790, f_00a8f1c8)
+constexpr u32 kEnFlags = 0;        // bit 31 (0x80000000): EN depleted / redline
+constexpr u32 kEnCur = 4;          // float current EN
+constexpr u32 kEnMax = 8;          // float max EN
+constexpr u32 kWpnBankR = 428;     // Right bank: +0 active_idx, +4 target_idx, +8 slots[2]*20, +48 count
+constexpr u32 kWpnBankL = 480;     // Left bank: identical layout
+constexpr u32 kWpnHolders = 1072;  // 6 weapon holder ptrs (f_00a1a7a8): holder+4=Weapon*, holder+8=purged
+
+u32 body_ac_obj(u32 body) {
+  if (!body || !rt::vm::committed(body + kBodyAcObj, 4)) return 0;
+  const u32 ac = r32(body + kBodyAcObj);
+  if (ac < 0x10000000u || !rt::vm::committed(ac + kAcEnObj + 16, 4)) return 0;
+  return ac;
+}
+
+u32 body_wpn_mgr(u32 body) {
+  const u32 ac = body_ac_obj(body);
+  if (!ac) return 0;
+  const u32 wm = r32(ac + kAcWpnMgr);
+  if (wm < 0x10000000u || !rt::vm::committed(wm + kWpnHolders + 24, 4)) return 0;
+  return wm;
+}
+
+bool read_body_en(u32 body, float* out_cur, float* out_max, bool* out_redline) {
+  const u32 ac = body_ac_obj(body);
+  if (!ac) return false;
+  const u32 en = ac + kAcEnObj;
+  const float cur = float(ppu::rf32(en + kEnCur));
+  const float maxv = float(ppu::rf32(en + kEnMax));
+  if (!std::isfinite(cur) || !std::isfinite(maxv) || maxv <= 10.0f || maxv > 1e7f) return false;
+  if (out_cur) *out_cur = cur;
+  if (out_max) *out_max = maxv;
+  if (out_redline) *out_redline = (r32(en + kEnFlags) & 0x80000000u) != 0;
+  return true;
+}
+
+void write_body_en(u32 body, float cur, bool redline) {
+  const u32 ac = body_ac_obj(body);
+  if (!ac || !std::isfinite(cur)) return;
+  const u32 en = ac + kAcEnObj;
+  const float maxv = float(ppu::rf32(en + kEnMax));
+  if (!std::isfinite(maxv) || maxv <= 10.0f || maxv > 1e7f) return;
+  float clamped = cur < 0.0f ? 0.0f : (cur > maxv ? maxv : cur);
+  wf32(en + kEnCur, clamped);
+  u32 flags = r32(en + kEnFlags);
+  if (redline)
+    flags |= 0x80000000u;
+  else
+    flags &= ~0x80000000u;
+  ppu::w32(en + kEnFlags, flags);
+}
+
+constexpr u32 kAmmoFnMag = 0x00abfba4u;     // Magazine AmmoController::GetInfo (ac+4 -> mag+28/+32/+36)
+constexpr u32 kAmmoFnDirect = 0x00ac0490u;  // Direct AmmoController::GetInfo (ac+4 cur, ac+8 max)
+
+u32 weapon_ammo_fn(u32 wpn, u32* out_ac) {
+  if (wpn < 0x10000000u || !rt::vm::committed(wpn + 12, 4)) return 0;
+  const u32 ac = r32(wpn + 8);
+  if (ac < 0x10000000u || !rt::vm::committed(ac + 12, 4)) return 0;
+  const u32 avt = r32(ac);
+  if (avt < 0x10000000u || !rt::vm::committed(avt + 12, 4)) return 0;
+  const u32 opd = r32(avt + 8);
+  if (opd < 0x00010000u || !rt::vm::committed(opd, 4)) return 0;
+  if (out_ac) *out_ac = ac;
+  return r32(opd);
+}
+
+int16_t read_holder_live_ammo(u32 holder) {
+  if (holder < 0x10000000u || !rt::vm::committed(holder + 12, 4)) return -1;
+  if (r32(holder + 8) != 0) return -1;  // purged
+  u32 ac = 0;
+  const u32 fn = weapon_ammo_fn(r32(holder + 4), &ac);
+  if (fn == kAmmoFnMag) {
+    const u32 mag = r32(ac + 4);
+    if (mag < 0x10000000u || !rt::vm::committed(mag + 40, 4)) return -1;
+    const s32 cur_mag = s32(r32(mag + 28));
+    const s32 res = s32(r32(mag + 36));
+    const s32 tot = cur_mag + res;
+    if (cur_mag >= 0 && res >= 0 && tot <= 32767) return int16_t(tot);
+  } else if (fn == kAmmoFnDirect) {
+    const s32 cur = s32(r32(ac + 4));
+    const s32 maxa = s32(r32(ac + 8));
+    if (cur != 99999 && maxa > 0 && cur >= 0 && cur <= 32767) return int16_t(cur);
+  }
+  return -1;
+}
+
+void write_holder_live_ammo(u32 holder, int16_t want) {
+  if (want < 0 || holder < 0x10000000u || !rt::vm::committed(holder + 12, 4)) return;
+  if (r32(holder + 8) != 0) return;  // purged
+  u32 ac = 0;
+  const u32 fn = weapon_ammo_fn(r32(holder + 4), &ac);
+  if (fn == kAmmoFnMag) {
+    const u32 mag = r32(ac + 4);
+    if (mag < 0x10000000u || !rt::vm::committed(mag + 40, 4)) return;
+    const s32 cur_mag = s32(r32(mag + 28));
+    const s32 res = s32(r32(mag + 36));
+    if (cur_mag < 0 || res < 0 || cur_mag + res == s32(want)) return;
+    if (s32(want) >= cur_mag) {
+      ppu::w32(mag + 36, u32(s32(want) - cur_mag));
+    } else {
+      ppu::w32(mag + 36, 0u);
+      ppu::w32(mag + 28, u32(want));
+    }
+  } else if (fn == kAmmoFnDirect) {
+    const s32 cur = s32(r32(ac + 4));
+    const s32 maxa = s32(r32(ac + 8));
+    if (cur == 99999 || maxa <= 0) return;
+    const s32 clamped = s32(want) > maxa ? maxa : s32(want);
+    if (cur != clamped) ppu::w32(ac + 4, u32(clamped));
+  }
+}
+
+bool read_body_weapons(u32 body, rt::game::coopnet::WeaponSyncState* out) {
+  if (!out) return false;
+  *out = rt::game::coopnet::WeaponSyncState{};
+  const u32 wm = body_wpn_mgr(body);
+  if (!wm) return false;
+  const s32 r_cnt = s32(r32(wm + kWpnBankR + 48));
+  const s32 r_act = s32(r32(wm + kWpnBankR));
+  const s32 l_cnt = s32(r32(wm + kWpnBankL + 48));
+  const s32 l_act = s32(r32(wm + kWpnBankL));
+  const uint8_t rn = (r_cnt > 0 && r_act >= 0 && r_act < 4) ? uint8_t(r_act) : 0x0fu;
+  const uint8_t ln = (l_cnt > 0 && l_act >= 0 && l_act < 4) ? uint8_t(l_act) : 0x0fu;
+  out->active = uint8_t(rn | (ln << 4));
+  uint8_t purged = 0;
+  for (int i = 0; i < 6; ++i) {
+    const u32 holder = r32(wm + kWpnHolders + 4u * u32(i));
+    if (holder >= 0x10000000u && rt::vm::committed(holder + 12, 4)) {
+      if (r32(holder + 8) != 0)
+        purged |= uint8_t(1u << i);
+      else
+        out->ammo[i] = read_holder_live_ammo(holder);
+    }
+  }
+  out->purged = purged;
+  return true;
+}
+
+void write_body_hud_ammo(u32 body, const int16_t ammo[6]) {
+  const u32 wm = body_wpn_mgr(body);
+  if (!wm) return;
+  // Write directly to each weapon's live AmmoController (Magazine +28/+36 or Direct +4) so both
+  // actual firing/empty-gun mechanics AND the HUD display stay 100% locked to the host.
+  for (int i = 0; i < 6; ++i) {
+    if (ammo[i] < 0) continue;
+    const u32 holder = r32(wm + kWpnHolders + 4u * u32(i));
+    write_holder_live_ammo(holder, ammo[i]);
+  }
+}
+
+std::mutex g_purge_mu;
+std::vector<u32> g_pending_purges;
+
+struct WpnDebounce {
+  double sw_mismatch_since[2] = {-1.0, -1.0};
+  double purge_mismatch_since[6] = {-1.0, -1.0, -1.0, -1.0, -1.0, -1.0};
+  uint8_t purge_queued_mask = 0;
+};
+WpnDebounce g_wpn_db[3];  // [1] = body1, [2] = body2
+
+void reconcile_body_weapons(int which, u32 body, uint8_t want_active, uint8_t want_purged) {
+  if (which < 1 || which > 2 || !body) return;
+  const u32 wm = body_wpn_mgr(body);
+  if (!wm) return;
+  const double now = rt::log_time();
+  WpnDebounce& db = g_wpn_db[which];
+  constexpr double kDebounce = 0.40;  // survive normal RTT without fighting in-flight inputs
+  // 1) Active weapon switch reconciliation (right = bank 0, left = bank 1).
+  const u32 banks[2] = {wm + kWpnBankR, wm + kWpnBankL};
+  for (int b = 0; b < 2; ++b) {
+    const uint8_t want = uint8_t((want_active >> (b * 4)) & 0x0fu);
+    const s32 cnt = s32(r32(banks[b] + 48));
+    const s32 cur = s32(r32(banks[b]));
+    const s32 tgt = s32(r32(banks[b] + 4));
+    if (want < 4 && s32(want) < cnt && cur != s32(want) && tgt != s32(want)) {
+      if (db.sw_mismatch_since[b] < 0.0) db.sw_mismatch_since[b] = now;
+      if (now - db.sw_mismatch_since[b] >= kDebounce) {
+        ppu::w32(banks[b] + 4, u32(want));  // target_idx -> native weapon-switch animation
+        db.sw_mismatch_since[b] = -1.0;
+        LOG_I("coop", "COOP WPN: body%d %s bank switched %d -> %u (reconciled)", which, b == 0 ? "R" : "L", cur,
+              unsigned(want));
+      }
+    } else {
+      db.sw_mismatch_since[b] = -1.0;
+    }
+  }
+  // 2) Purged weapon reconciliation: if peer purged holder i and we still hold it, queue native f_00a29aac(slot).
+  for (int i = 0; i < 6; ++i) {
+    if (!(want_purged & (1u << i))) {
+      db.purge_mismatch_since[i] = -1.0;
+      continue;
+    }
+    const u32 holder = r32(wm + kWpnHolders + 4u * u32(i));
+    if (holder < 0x10000000u || !rt::vm::committed(holder + 12, 4)) continue;
+    if (r32(holder + 8) != 0) {
+      db.purge_mismatch_since[i] = -1.0;
+      continue;  // already purged locally
+    }
+    if (db.purge_queued_mask & (1u << i)) continue;
+    if (db.purge_mismatch_since[i] < 0.0) db.purge_mismatch_since[i] = now;
+    if (now - db.purge_mismatch_since[i] < kDebounce) continue;
+    // Locate the 20-byte bank slot referencing this holder (+12 == holder) for f_00a29aac(slot).
+    u32 slot_addr = 0;
+    for (int b = 0; b < 2 && !slot_addr; ++b) {
+      const s32 cnt = s32(r32(banks[b] + 48));
+      for (s32 k = 0; k < cnt && k < 2; ++k) {
+        const u32 s_ptr = banks[b] + 8u + 20u * u32(k);
+        if (r32(s_ptr + 12) == holder) {
+          slot_addr = s_ptr;
+          break;
+        }
+      }
+    }
+    if (slot_addr) {
+      db.purge_queued_mask |= uint8_t(1u << i);
+      {
+        std::lock_guard lk(g_purge_mu);
+        g_pending_purges.push_back(slot_addr);
+      }
+      LOG_I("coop", "COOP WPN: body%d queued native purge for holder[%d] 0x%08x (slot 0x%08x)", which, i, holder,
+            slot_addr);
+    }
+  }
+}
+
+void log_weapons_once(u32 b1, u32 b2) {
+  static uint16_t logged_ep = 0;
+  const uint16_t ep = rt::game::coopsession::epoch();
+  if (!ep || ep == logged_ep || !b1 || !b2 || !rt::game::coopsession::linked_in_mission()) return;
+  float en1 = 0.0f, enm1 = 0.0f, en2 = 0.0f, enm2 = 0.0f;
+  bool r1 = false, r2 = false;
+  if (!read_body_en(b1, &en1, &enm1, &r1) || !read_body_en(b2, &en2, &enm2, &r2)) return;
+  rt::game::coopnet::WeaponSyncState w1{}, w2{};
+  if (!read_body_weapons(b1, &w1) || !read_body_weapons(b2, &w2)) return;
+  logged_ep = ep;
+  LOG_I("coop", "COOP EN: body1 %.1f/%.1f (red=%d) | body2 %.1f/%.1f (red=%d)", double(en1), double(enm1), int(r1),
+        double(en2), double(enm2), int(r2));
+  LOG_I("coop", "COOP WPN: b1 act=0x%02x prg=0x%02x ammo=[%d,%d,%d,%d,%d,%d] | b2 act=0x%02x prg=0x%02x ammo=[%d,%d,%d,%d,%d,%d]",
+        unsigned(w1.active), unsigned(w1.purged), int(w1.ammo[0]), int(w1.ammo[1]), int(w1.ammo[2]), int(w1.ammo[3]),
+        int(w1.ammo[4]), int(w1.ammo[5]), unsigned(w2.active), unsigned(w2.purged), int(w2.ammo[0]), int(w2.ammo[1]),
+        int(w2.ammo[2]), int(w2.ammo[3]), int(w2.ammo[4]), int(w2.ammo[5]));
+  if (const u32 wm1 = body_wpn_mgr(b1)) {
+    std::string winfo;
+    for (int i = 0; i < 6; ++i) {
+      const u32 h = r32(wm1 + kWpnHolders + 4u * u32(i));
+      if (h < 0x10000000u || !rt::vm::committed(h + 12, 4)) continue;
+      const u32 w = r32(h + 4);
+      if (w < 0x10000000u || !rt::vm::committed(w, 4)) continue;
+      const u32 vt = r32(w);
+      u32 fn52 = 0, ac = 0, af8 = 0;
+      if (vt >= 0x10000000u && rt::vm::committed(vt + 56, 4)) {
+        const u32 opd = r32(vt + 52);
+        if (opd >= 0x00010000u && rt::vm::committed(opd, 4)) fn52 = r32(opd);
+      }
+      if (rt::vm::committed(w + 12, 4)) {
+        ac = r32(w + 8);
+        if (ac >= 0x10000000u && rt::vm::committed(ac, 4)) {
+          const u32 avt = r32(ac);
+          if (avt >= 0x10000000u && rt::vm::committed(avt + 12, 4)) {
+            const u32 aopd = r32(avt + 8);
+            if (aopd >= 0x00010000u && rt::vm::committed(aopd, 4)) af8 = r32(aopd);
+          }
+        }
+      }
+      winfo += ac4::strprintf(" [%d]w=0x%08x(vt=0x%08x,f52=0x%08x,ac=0x%08x,af8=0x%08x)", i, w, vt, fn52, ac, af8);
+    }
+    if (!winfo.empty()) LOG_I("coop", "COOP WPN OBJ:%s", winfo.c_str());
+  }
+}
+
+u32 body_pa_obj(u32 body) {
+  if (!body || !rt::vm::committed(body + kBodyPaObj, 4)) return 0;
+  const u32 pa = r32(body + kBodyPaObj);
+  if (pa < 0x10000000u || !rt::vm::committed(pa + kPaObjMax + 4, 4)) return 0;
+  return pa;
+}
+
+bool read_body_pa(u32 body, float* out_cur, float* out_max) {
+  const u32 pa = body_pa_obj(body);
+  if (!pa) return false;
+  const float cur = float(ppu::rf32(pa + kPaObjCur));
+  const float base = float(ppu::rf32(pa + kPaObjMax));
+  const float mult = float(ppu::rf32(pa + kPaObjMult));
+  const float maxv = (std::isfinite(mult) && mult > 0.01f && mult <= 10.0f) ? (base * mult) : base;
+  if (!std::isfinite(cur) || !std::isfinite(maxv) || maxv <= 1.0f) return false;
+  if (out_cur) *out_cur = cur;
+  if (out_max) *out_max = maxv;
+  return true;
+}
 
 std::atomic<u32> g_body[3];  // [1] the local player, [2] the second AC
 std::atomic<u32> g_obj[3];
@@ -304,24 +599,40 @@ void net_frame() {
     }
   }
 
-  // Publish this instance's OWN AC1 AP & PA (for Partner HUD on the peer).
+  // Publish this instance's OWN AC1 AP, PA & active/purged weapons (for Partner HUD & visual AC2 sync).
   if (b1 && rt::vm::committed(b1 + kBodyApMax, 4)) {
     const float ap1 = float(ppu::rf32(b1 + kBodyAp));
     const float apm1 = float(ppu::rf32(b1 + kBodyApMax));
     float pa1 = 0.0f, pam1 = 0.0f;
-    if (rt::vm::committed(b1 + kBodyPaMax, 4)) {
-      pa1 = float(ppu::rf32(b1 + kBodyPa));
-      pam1 = float(ppu::rf32(b1 + kBodyPaMax));
-    }
+    read_body_pa(b1, &pa1, &pam1);
     rt::game::coopnet::set_local_self_vitals(ap1, apm1, pa1, pam1);
+    rt::game::coopnet::WeaponSyncState w1{};
+    if (read_body_weapons(b1, &w1)) rt::game::coopnet::set_local_self_weapons(w1.active, w1.purged);
   }
 
-  // The AP & PA of the AC this instance simulates FOR the peer (AC2). On the host that is the join
-  // player, so the host's damage & Primal Armor model is authoritative for the join's own AC1.
+  // The AP, PA, EN & weapons of the AC this instance simulates FOR the peer (AC2). On the host that
+  // is the join player, so the host's damage, PA, EN, ammo & weapon state are authoritative for AC1.
   if (b2_now && rt::vm::committed(b2_now + kBodyApMax, 4)) {
     rt::game::coopnet::set_local_peer_ap(float(ppu::rf32(b2_now + kBodyAp)), float(ppu::rf32(b2_now + kBodyApMax)));
-    if (rt::vm::committed(b2_now + kBodyPaMax, 4))
-      rt::game::coopnet::set_local_peer_pa(float(ppu::rf32(b2_now + kBodyPa)), float(ppu::rf32(b2_now + kBodyPaMax)));
+    float pa2 = 0.0f, pam2 = 0.0f;
+    if (read_body_pa(b2_now, &pa2, &pam2)) rt::game::coopnet::set_local_peer_pa(pa2, pam2);
+    float en2 = 0.0f, enm2 = 0.0f;
+    bool en2_red = false;
+    if (read_body_en(b2_now, &en2, &enm2, &en2_red)) rt::game::coopnet::set_local_peer_en(en2, enm2, en2_red);
+    rt::game::coopnet::WeaponSyncState w2{};
+    if (read_body_weapons(b2_now, &w2)) rt::game::coopnet::set_local_peer_weapons(w2);
+    log_weapons_once(b1, b2_now);
+    // Log verified PA sub-object once per epoch for diagnostics.
+    static uint16_t pa_logged_ep = 0;
+    const uint16_t ep_now = rt::game::coopsession::epoch();
+    if (ep_now && ep_now != pa_logged_ep && b1 && pam2 > 1.0f) {
+      float pa1 = 0.0f, pam1 = 0.0f;
+      if (read_body_pa(b1, &pa1, &pam1)) {
+        pa_logged_ep = ep_now;
+        LOG_I("coop", "COOP PA: body1 0x%08x pa_obj 0x%08x (%.1f/%.1f) | body2 0x%08x pa_obj 0x%08x (%.1f/%.1f)",
+              b1, body_pa_obj(b1), double(pa1), double(pam1), b2_now, body_pa_obj(b2_now), double(pa2), double(pam2));
+      }
+    }
   }
 
   rt::game::coopnet::PadState pad;
@@ -344,14 +655,21 @@ void net_frame() {
       last_ap = t.ap;
     }
   }
-  if (rt::game::coopnet::role_join() && b1 && t.peer_pamax > 100.0f && std::isfinite(t.peer_pa) &&
-      t.peer_pa >= 0.0f && t.peer_pa <= t.peer_pamax * 1.5f && rt::vm::committed(b1 + kBodyPaMax, 4)) {
-    const float local_pamax = float(ppu::rf32(b1 + kBodyPaMax));
-    if (local_pamax > 100.0f) {
+  if (rt::game::coopnet::role_join() && b1 && t.peer_pamax > 1.0f && std::isfinite(t.peer_pa) &&
+      t.peer_pa >= 0.0f && t.peer_pa <= t.peer_pamax * 1.5f) {
+    const u32 pa1 = body_pa_obj(b1);
+    float local_cur = 0.0f, local_pamax = 0.0f;
+    if (pa1 && read_body_pa(b1, &local_cur, &local_pamax)) {
       const float clamped = t.peer_pa > local_pamax ? local_pamax : t.peer_pa;
-      ppu::wf32(b1 + kBodyPa, clamped);
+      ppu::wf32(pa1 + kPaObjCur, clamped);
     }
   }
+  if (rt::game::coopnet::role_join() && b1) {
+    if (t.peer_enmax > 10.0f && std::isfinite(t.peer_en)) write_body_en(b1, t.peer_en, t.peer_en_redline);
+    write_body_hud_ammo(b1, t.peer_wpn.ammo);
+    reconcile_body_weapons(1, b1, t.peer_wpn.active, t.peer_wpn.purged);
+  }
+  if (b2) reconcile_body_weapons(2, b2, t.self_wpn_active, t.self_wpn_purged);
   if (!b2 || !g_pos.any) return;
   if (!rt::vm::committed(b2 + 0x1c0, 16)) return;
   if (!pos_valid(t.position) || (t.position[0] * t.position[0] + t.position[1] * t.position[1] + t.position[2] * t.position[2] < 1.0f))
@@ -425,7 +743,28 @@ void coop_body_reset() {
   for (int i = 1; i <= 2; ++i) {
     g_body[i].store(0, std::memory_order_relaxed);
     g_obj[i].store(0, std::memory_order_relaxed);
+    g_wpn_db[i] = WpnDebounce{};
   }
+  std::lock_guard lk(g_purge_mu);
+  g_pending_purges.clear();
+}
+
+void coop_body_reassert_join_vitals(u32 b1) {
+  if (!b1 || !rt::game::coopnet::role_join()) return;
+  float en = 0.0f, enmax = 0.0f;
+  bool red = false;
+  if (rt::game::coopnet::peer_en(&en, &enmax, &red)) write_body_en(b1, en, red);
+  rt::game::coopnet::WeaponSyncState w{};
+  if (rt::game::coopnet::peer_weapons(&w)) write_body_hud_ammo(b1, w.ammo);
+}
+
+size_t coop_body_drain_purges(u32* out_slots, size_t max) {
+  if (!out_slots || !max) return 0;
+  std::lock_guard lk(g_purge_mu);
+  const size_t n = g_pending_purges.size() < max ? g_pending_purges.size() : max;
+  for (size_t i = 0; i < n; ++i) out_slots[i] = g_pending_purges[i];
+  g_pending_purges.erase(g_pending_purges.begin(), g_pending_purges.begin() + std::ptrdiff_t(n));
+  return n;
 }
 
 u32 coop_body(int which) { return (which >= 1 && which <= 2) ? g_body[which].load(std::memory_order_relaxed) : 0; }

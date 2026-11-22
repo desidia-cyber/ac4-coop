@@ -16,6 +16,7 @@
 #include "ppu/ppu_recomp.h"
 #include "runtime/game/coop_body.h"
 #include "runtime/game/coop_build.h"
+#include "runtime/game/coop_entities.h"
 #include "runtime/game/coop_net.h"
 #include "runtime/game/coop_session.h"
 #include "runtime/game/frame_policy.h"
@@ -26,6 +27,8 @@
 
 void f_002a0bd4(ppu::Ctx&);  // lua_pushlstring(L, s, len)
 void f_007cca94(ppu::Ctx&);  // the mission screen's sortie start (hooked: sortie_start)
+void f_009723e0(ppu::Ctx&);  // MissionParamTable* getter (used by f_007ce2e4)
+void f_00972da0(ppu::Ctx&);  // MissionParamEntry* lookup(table, index): r16(entry + 2) == mission number
 void f_00b0e4d8(ppu::Ctx&);  // SetMissionResult (vtable 0x101463c0 slot 0x88)
 void f_00b0e2e4(ppu::Ctx&);  // SetMissionEndingFlowCAPEvent (vtable 0x101463c0 slot 0x3c)
 void f_00b0ebe0(ppu::Ctx&);  // SetMissionMode (vtable 0x101463c0 slot 0x100)
@@ -123,6 +126,7 @@ double g_autostart_at = -1e9, g_idle_since = -1;
 constexpr u32 kPlayerObjVt = 0x101463c0u;
 std::atomic<u32> g_player_obj[3] = {0, 0, 0};
 std::atomic<uint16_t> g_kill_epoch{0};  // test aid: the epoch whose success stopped the autokill
+std::atomic<uint16_t> g_result_epoch{0};  // epoch in which SetMissionResult or EndingFlow already ran
 std::atomic<int> g_lua_handler_depth{0};  // >0 while inside a wrapped mXXX.lua handler (host or join replay)
 thread_local bool t_in_native_exec = false;
 bool g_autostart_pending = false;
@@ -506,6 +510,11 @@ int lua_command(ppu::Ctx& ctx, u32 L, const std::string& cmd) {
     {
       std::lock_guard lk(g_mu);
       if (ep) {
+        // WatchEntityDistNearInfinity / FarInfinity (m000, m280, m350) fire every frame while the
+        // player stays within range; collapse consecutive identical OnNear_*/OnFar_* payloads so
+        // g_events never floods with thousands of duplicate distance ticks.
+        const bool level_dist = (rest.rfind("OnNear_", 0) == 0 || rest.rfind("OnFar_", 0) == 0);
+        if (level_dist && !g_events.empty() && g_events.back() == rest) return 0;
         g_events.push_back(rest);
         seq = uint32_t(g_events.size());
         g_sent_upto = seq;
@@ -556,6 +565,16 @@ int lua_command(ppu::Ctx& ctx, u32 L, const std::string& cmd) {
     if (rest == "killp2" && host()) {
       const char* v = std::getenv("AC4_COOP_TEST_KILLP2");
       if (v && *v) return lua_return_string(ctx, L, v);
+    }
+    // "killp1" = AC4_COOP_TEST_KILLP1=<seconds>: the host kills player 1 (entity 1000) once,
+    // to exercise host-death replication (including unpatched m080-m380 player chara scripts).
+    if (rest == "killp1" && host()) {
+      const char* v = std::getenv("AC4_COOP_TEST_KILLP1");
+      if (v && *v) return lua_return_string(ctx, L, v);
+    }
+    if (rest == "has_result") {
+      const uint16_t ep = g_epoch.load(std::memory_order_relaxed);
+      if (ep && g_result_epoch.load(std::memory_order_relaxed) == ep) return lua_return_string(ctx, L, "1");
     }
     return 0;
   }
@@ -608,6 +627,45 @@ void reset_rx() {
 //         only marks the join ready, and the host's start later starts it (autostart_tick).
 bool on_sortie_start(ppu::Ctx& ctx) {
   if (!net::active()) return true;
+  if (host()) {
+    // Optional rig test aid: AC4_COOP_TEST_MISSION=<3-digit mission num, e.g. 80, 290, 350, 490>
+    // and AC4_COOP_TEST_HARD=1 override the mission launched from the hub so any mission can be
+    // live-tested on a fresh save. Complete no-op when unset.
+    if (const char* tm = std::getenv("AC4_COOP_TEST_MISSION"); tm && *tm) {
+      const int want = std::atoi(tm);
+      if (want >= 0 && want <= 999) {
+        u64 saved_r[14];
+        for (int i = 0; i < 14; ++i) saved_r[i] = ctx.r[i];
+        const u64 saved_lr = ctx.lr;
+        f_009723e0(ctx);
+        const u32 tbl = u32(ctx.r[3]);
+        int found = -1;
+        for (int idx = 0; idx < 120 && tbl; ++idx) {
+          ctx.r[2] = saved_r[2];
+          ctx.r[3] = tbl;
+          ctx.r[4] = u64(idx);
+          f_00972da0(ctx);
+          const u32 ent = u32(ctx.r[3]);
+          if (ent && rt::vm::committed(ent, 4) && int(ppu::r16(ent + 2)) == want) {
+            found = idx;
+            break;
+          }
+        }
+        for (int i = 0; i < 14; ++i) ctx.r[i] = saved_r[i];
+        ctx.lr = saved_lr;
+        if (found >= 0) {
+          LOG_W("coop", "COOP TEST: overriding sortie mission index %u -> %d (m%03d)", u32(ctx.r[4]), found, want);
+          ctx.r[4] = u64(found);
+        } else {
+          LOG_W("coop", "COOP TEST: mission m%03d not found in MissionParam table", want);
+        }
+      }
+    }
+    if (const char* th = std::getenv("AC4_COOP_TEST_HARD"); th && th[0] == '1') {
+      LOG_W("coop", "COOP TEST: overriding sortie difficulty -> HARD (r5=1)");
+      ctx.r[5] = 1;
+    }
+  }
   const uint32_t mine = key_encode(ctx.r[4], ctx.r[5], ctx.r[6]);
   if (host()) {
     const uint16_t ep = new_epoch();
@@ -954,6 +1012,11 @@ void frame() {
   }
 }
 
+void note_local_keys_changed() {
+  if (!net::active()) return;
+  send_lobby();
+}
+
 std::string hud_banner() {
   if (!net::active()) return {};
   const Phase ph = Phase(g_phase.load());
@@ -1204,7 +1267,15 @@ void hook_flow_tick(Ctx& ctx, void (*orig)(Ctx&)) {
 // start runs here, after the list's own work for this frame.
 void hook_menu_tick(Ctx& ctx, void (*orig)(Ctx&)) {
   const u32 scene = u32(ctx.r[3]);
+  const u32 msg_type = u32(ctx.r[4]);
+  const u32 msg_id = u32(ctx.r[5]);
   orig(ctx);
+  // Universal non-player actor death observer on host: both weapon kills (f_00a5091c) and scripted
+  // kills (KillEventGroup/KillEntity -> f_00b0edfc) dispatch (2, 0x80020064) through f_004dd4d0.
+  if (msg_type == 2u && msg_id == 0x80020064u && scene >= 0x10000000u &&
+      rt::game::coopnet::role_host() && rt::vm::committed(scene, 8) && r32(scene) == 0x10142638u) {
+    rt::game::coop_entities_note_dead(scene);
+  }
   if (!rt::game::coopnet::role_join() || !rt::vm::committed(scene, 4) || r32(scene) != kMissionListVt) return;
   static std::atomic<int> n{0};
   const u32 flow = g_flow.load();
@@ -1243,6 +1314,7 @@ static void player_redirect(Ctx& ctx, void (*orig)(Ctx&), const char* what) {
 // victory, m170/m310 endings) from host -> join over the reliable event stream, and blocks local
 // unpatched chara scripts from unilaterally ending the joiner's mission.
 static void native_event_gate(Ctx& ctx, void (*orig)(Ctx&), const char* kind, const char* what, bool block_on_join) {
+  const bool is_end_or_res = (std::strcmp(kind, "res") == 0 || std::strcmp(kind, "end") == 0);
   if (!t_in_native_exec && rt::game::coopsession::linked_in_mission() &&
       g_lua_handler_depth.load(std::memory_order_relaxed) == 0) {
     const u32 a4 = u32(ctx.r[4]), a5 = u32(ctx.r[5]);
@@ -1256,6 +1328,10 @@ static void native_event_gate(Ctx& ctx, void (*orig)(Ctx&), const char* kind, co
       }
       if (host()) publish_native_event(kind, a4, a5);
     }
+  }
+  if (is_end_or_res && rt::game::coopsession::linked_in_mission()) {
+    const uint16_t ep = g_epoch.load(std::memory_order_relaxed);
+    if (ep) g_result_epoch.store(ep, std::memory_order_relaxed);
   }
   player_redirect(ctx, orig, what);
 }

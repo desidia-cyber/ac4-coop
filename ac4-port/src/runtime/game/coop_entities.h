@@ -48,4 +48,21 @@ void coop_entities_reset();
 // Instant 1-frame discovery of newly spawned actors/reinforcements from hook_actor_update / hook_xform_blit.
 void coop_entities_note_live(u32 addr);
 
+// Host: records a non-player actor death event (0x80020064 via hook_menu_tick) so snapshot_publish
+// reports hp=0 even for scripted kills (KillEventGroup / KillEntity) that bypass entity+0x2a4.
+void coop_entities_note_dead(u32 addr);
+
+// Join: drains enemy actor addresses that transitioned alive->dead on the host and need native
+// death explosion execution (f_00a50cb8) on the PPU game thread (hook_xform_blit).
+size_t coop_entities_drain_kills(u32* out, size_t max);
+
+// Join: drains multi-part boss/ship sub-part breaks (entity, part_id, host_main_hp) for native
+// f_00a5091c part destruction VFX & hitbox/turret disable on the PPU game thread.
+struct PartBreakJob {
+  u32 addr;
+  s32 part_id;
+  float host_hp;
+};
+size_t coop_entities_drain_part_breaks(PartBreakJob* out, size_t max);
+
 }  // namespace rt::game

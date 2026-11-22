@@ -1314,7 +1314,7 @@ void draw_coop_hud(u32 w, u32 h) {
   if (v.valid) {
     // Top-left corner (clear of AC4's top-right radar, top-center AP/weapons, and bottom subtitles).
     const float x0 = 24.0f, y0 = 24.0f, x1 = 296.0f;
-    const bool has_pa = v.pamax > 100.0f;
+    const bool has_pa = v.pamax > 1.0f;
     const float y1 = has_pa ? 98.0f : 84.0f;
     g_gfx.brush->SetColor(D2D1::ColorF(0.03f, 0.04f, 0.05f, 0.72f));
     dc->FillRectangle(D2D1::RectF(x0, y0, x1, y1), g_gfx.brush);
