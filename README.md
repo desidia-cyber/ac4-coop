@@ -13,3 +13,7 @@ See **[COOP_README.md](COOP_README.md)** for full setup, gameplay, and troublesh
 - **`research/`** — Design docs and reverse-engineering findings (`*.md`).
 
 > **Note:** No copyrighted game files, disc images, extracted assets, saves, or compiled binaries are included in this repository. Supply your own *Armored Core 4* (`BLUS30027`) disc to prepare `run/data`, generate PPU/SPU code via `ac4-recomp` / `ac4-spurecomp`, build `ac4.exe`, and generate `payload/overlay_coop` via `python tools/coop_patch.py`.
+
+## Credits
+
+- [AC4-Port](https://github.com/sulphurs16/ac4-port) by SulphurS16 — the unofficial native PC port and static recompiler this co-op mod is built on (`ac4-port/`).
