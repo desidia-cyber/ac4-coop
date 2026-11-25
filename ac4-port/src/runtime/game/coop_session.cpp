@@ -302,7 +302,12 @@ void update_title() {
     p = g_peer;
   }
   std::string role = host() ? "HOST" : "JOIN";
-  std::string s = "Armored Core 4 co-op [" + role + "] ";
+  std::string s = "Armored Core 4 co-op [" + role;
+  if (net::transport_steam()) {
+    std::string st = net::transport_status();
+    if (!st.empty()) s += " | " + st;
+  }
+  s += "] ";
   if (!up) {
     s += host() ? "- waiting for the partner to connect" : "- connecting to the host...";
   } else if (join() && g_phase.load() == cs::kPlaying && p.phase == cs::kMenu) {

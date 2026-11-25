@@ -14,13 +14,17 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace rt::game::coopnet {
 
-// Reads AC4_COOP_HOST / AC4_COOP_JOIN and opens the socket. False when the link is not configured
-// (or the socket could not be opened: logged).
+// Reads AC4_COOP_HOST / AC4_COOP_JOIN (UDP) or AC4_COOP_STEAM_HOST / AC4_COOP_STEAM_JOIN (Spacewar
+// Steamworks) and opens the link. False when not configured or initialization failed (logged).
 bool init();
+void shutdown();
 bool active();
+bool transport_steam();
+std::string transport_status();
 
 // The state received from the peer for gamepad port 1. False when the link is not configured or no
 // packet has arrived for 1 s (the caller then reports the port as unconnected/neutral).

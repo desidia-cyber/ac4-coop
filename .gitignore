@@ -81,6 +81,7 @@
 *.obj
 *.a
 *keys*.txt
+steam_appid.txt
 
 # Python & OS/editor noise
 __pycache__/

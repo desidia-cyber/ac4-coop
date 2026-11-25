@@ -18,10 +18,24 @@ Double-click **`play_coop_join.bat`** and enter the Host's IP address (or run `.
   .\play_coop_join.ps1 -LocalTest -Windowed
   ```
 
+### Option B: Steam "Spacewar" (AppID 480) — No IPs or Port Forwarding
+Connect over Valve's Steamworks relay network (`ISteamNetworkingMessages`) using Steam lobbies and friend invites. Both players need the Steam desktop client running and logged in (no game ownership required; Steam displays Spacewar while active).
+
+- **Install-time Steam API DLL (not bundled):** `steam_api64.dll` is **not** included in this repository. It is obtained at install time from [Steamworks.NET — rlabrecque](https://github.com/rlabrecque/Steamworks.NET/releases) either automatically on first Steam launch or manually via:
+  ```powershell
+  .\tools\install_steam_api.ps1
+  ```
+- **Host (Steam):** Double-click **`play_coop_steam_host.bat`** (or run `.\play_coop_host.ps1 -Steam`).
+  - Creates a friends-only 2-player lobby, sets Steam Rich Presence, copies the Lobby ID to the clipboard, shows it in the window title, and opens the Steam invite dialog.
+- **Join (Steam):** Double-click **`play_coop_steam_join.bat`** (or run `.\play_coop_join.ps1 -Steam` or `.\play_coop_join.ps1 -Steam -LobbyId <LOBBY_ID>`).
+  - Leave the Lobby ID blank to automatically find a Steam friend hosting AC4 co-op (or accept a Steam invite / click **Join Game** while the mod is running), or paste the Host's Lobby ID.
+
 ### CLI Flags (Advanced)
 `ac4.exe` directly supports:
 - `--coop-host <port>` (e.g. `--coop-host 7777`)
 - `--coop-join <ip:port>` (e.g. `--coop-join 192.168.1.50:7777`)
+- `--coop-steam-host` (Spacewar AppID 480 host lobby)
+- `--coop-steam-join [lobby_id|auto]` (Spacewar AppID 480 join by lobby ID, friend auto-scan, or Steam invite; also supports Steam's `+connect_lobby <lobby_id>`)
 - Co-op mode automatically enables the second AC, freezes non-player local simulation on the joiner, and auto-detects `payload\overlay_coop` (you can still override with `--test-overlay <path>`).
 
 ---
@@ -65,4 +79,4 @@ Double-click **`play_coop_join.bat`** and enter the Host's IP address (or run `.
      ```powershell
      python tools\coop_patch.py
      ```
-- **Architecture:** Host-authoritative state replication over WinSock UDP (`coop_net.cpp`, `coop_session.cpp`, `coop_build.cpp`, `coop_body.cpp`, `coop_entities.cpp`, `coop_hooks.cpp`). With no co-op flags or `AC4_COOP*` environment variables set, solo gameplay is completely untouched.
+- **Architecture:** Host-authoritative state replication over WinSock UDP or optional Spacewar Steamworks P2P (`coop_net.cpp`, `coop_steam.cpp`, `coop_session.cpp`, `coop_build.cpp`, `coop_body.cpp`, `coop_entities.cpp`, `coop_hooks.cpp`). With no co-op flags or `AC4_COOP*` environment variables set, solo gameplay is completely untouched.

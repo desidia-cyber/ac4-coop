@@ -7,9 +7,9 @@ See **[COOP_README.md](COOP_README.md)** for full setup, gameplay, and troublesh
 ## Repository Layout
 
 - **`ac4-port/`** — Full PC port & recompiler source code with the co-op runtime (`src/runtime/game/coop_*.cpp/.h`, `hooks.txt`, `input_hooks.cpp`, `frame_hooks.cpp`, `rig.cpp`).
-- **`tools/`** — Mission script patcher (`coop_patch.py`, `bnd3tool.py`) and reverse-engineering utilities (`tools/re/`).
+- **`tools/`** — Mission script patcher (`coop_patch.py`, `bnd3tool.py`), install-time Steamworks.NET `steam_api64.dll` fetcher (`install_steam_api.ps1`), and reverse-engineering utilities (`tools/re/`).
 - **`run/`** — Co-op launcher scripts and automated dual-instance rig verification scripts (`coop_launch.ps1`, `coop_host.ps1`, `coop_join.ps1`, `coop_mission.py`, `rig/`).
-- **`play_coop_host.{bat,ps1}` / `play_coop_join.{bat,ps1}`** — One-click Host & Join launchers.
+- **`play_coop_host.{bat,ps1}` / `play_coop_join.{bat,ps1}` / `play_coop_steam_{host,join}.bat`** — One-click Host & Join launchers (direct UDP or Steam Spacewar AppID 480).
 - **`research/`** — Design docs and reverse-engineering findings (`*.md`).
 
 > **Note:** No copyrighted game files, disc images, extracted assets, saves, or compiled binaries are included in this repository. Supply your own *Armored Core 4* (`BLUS30027`) disc to prepare `run/data`, generate PPU/SPU code via `ac4-recomp` / `ac4-spurecomp`, build `ac4.exe`, and generate `payload/overlay_coop` via `python tools/coop_patch.py`.

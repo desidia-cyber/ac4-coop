@@ -189,6 +189,19 @@ int main(int argc, char** argv) {
       std::string ep = next();
       SetEnvironmentVariableA("AC4_COOP", "1");
       SetEnvironmentVariableA("AC4_COOP_JOIN", ep.c_str());
+    } else if (a == "--coop-steam-host") {
+      SetEnvironmentVariableA("AC4_COOP", "1");
+      SetEnvironmentVariableA("AC4_COOP_STEAM_HOST", "1");
+    } else if (a == "--coop-steam-join") {
+      std::string lid = "auto";
+      if (i + 1 < argc && argv[i + 1][0] != '-') lid = argv[++i];
+      SetEnvironmentVariableA("AC4_COOP", "1");
+      SetEnvironmentVariableA("AC4_COOP_STEAM_JOIN", lid.c_str());
+    } else if (a == "+connect_lobby") {
+      std::string lid = next();
+      if (lid.empty()) lid = "auto";
+      SetEnvironmentVariableA("AC4_COOP", "1");
+      SetEnvironmentVariableA("AC4_COOP_STEAM_JOIN", lid.c_str());
     }
     else if (a == "--rig") c.rig_script = next();
     else if (a == "--rig-shots") c.rig_shots = next();
@@ -199,7 +212,8 @@ int main(int argc, char** argv) {
     }
   }
   rig::init();
-  game::coopnet::init();  // AC4_COOP_HOST / AC4_COOP_JOIN: the co-op UDP link (coop_net.h); no-op otherwise
+  game::coopnet::init();  // AC4_COOP_HOST / AC4_COOP_JOIN (UDP) or AC4_COOP_STEAM_* (Spacewar Steamworks)
+  std::atexit(game::coopnet::shutdown);
   // In co-op mode, automatically locate the mission Lua overlay if --test-overlay was not passed.
   if (game::coopnet::active() && c.test_overlay.empty()) {
     char exe_buf[MAX_PATH]{};
@@ -331,6 +345,7 @@ int main(int argc, char** argv) {
           (unsigned long long)ppu::granule_conflicts());
     rsx::dump();
     dump_hle_stats();
+    game::coopnet::shutdown();
     log_flush();
     ExitProcess(0);
   };

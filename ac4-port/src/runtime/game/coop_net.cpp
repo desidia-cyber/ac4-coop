@@ -21,6 +21,7 @@
 #include "runtime/game/coop_body.h"
 #include "runtime/game/coop_net.h"
 #include "runtime/game/coop_session.h"
+#include "runtime/game/coop_steam.h"
 #include "runtime/log.h"
 
 namespace {
@@ -97,6 +98,7 @@ static_assert(kHeader + sizeof(SnapshotPayload) + 18 * sizeof(SnapshotRecordWire
               "18 records fit in one datagram");
 
 SOCKET g_sock = INVALID_SOCKET;
+bool g_transport_steam = false;
 bool g_host = false;
 sockaddr_in g_peer{};
 bool g_have_peer = false;
@@ -189,7 +191,7 @@ void note_peer(const sockaddr_in& from) {
 }
 
 void flush_delayed_sends() {
-  if (g_sim_latency_ms <= 0 || g_sock == INVALID_SOCKET) return;
+  if (g_sim_latency_ms <= 0 || (!g_transport_steam && g_sock == INVALID_SOCKET)) return;
   const uint64_t now = GetTickCount64();
   std::vector<DelayedPkt> due;
   {
@@ -200,20 +202,26 @@ void flush_delayed_sends() {
     }
   }
   for (const auto& p : due) {
-    if (sendto(g_sock, reinterpret_cast<const char*>(p.bytes.data()), int(p.bytes.size()), 0,
-               reinterpret_cast<const sockaddr*>(&p.peer), sizeof p.peer) != SOCKET_ERROR) {
+    if (g_transport_steam) {
+      if (rt::game::coopsteam::send(p.bytes.data(), p.bytes.size())) {
+        g_sent.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else if (sendto(g_sock, reinterpret_cast<const char*>(p.bytes.data()), int(p.bytes.size()), 0,
+                      reinterpret_cast<const sockaddr*>(&p.peer), sizeof p.peer) != SOCKET_ERROR) {
       g_sent.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }
 
 void send_packet(uint8_t type, uint16_t seq, const void* payload, size_t len) {
-  if (g_sock == INVALID_SOCKET) return;
-  sockaddr_in peer;
-  {
+  if (!g_transport_steam && g_sock == INVALID_SOCKET) return;
+  sockaddr_in peer{};
+  if (!g_transport_steam) {
     std::lock_guard lk(g_mu);
     if (!g_have_peer) return;
     peer = g_peer;
+  } else {
+    if (!rt::game::coopsteam::peer_steam_id()) return;
   }
   uint8_t buf[kMaxDatagram];
   if (kHeader + len > sizeof buf) return;
@@ -243,13 +251,160 @@ void send_packet(uint8_t type, uint16_t seq, const void* payload, size_t len) {
     }
     return;
   }
-  if (sendto(g_sock, reinterpret_cast<const char*>(buf), int(kHeader + len), 0,
-             reinterpret_cast<const sockaddr*>(&peer), sizeof peer) == SOCKET_ERROR)
-    return;
+  if (g_transport_steam) {
+    if (!rt::game::coopsteam::send(buf, kHeader + len)) return;
+  } else {
+    if (sendto(g_sock, reinterpret_cast<const char*>(buf), int(kHeader + len), 0,
+               reinterpret_cast<const sockaddr*>(&peer), sizeof peer) == SOCKET_ERROR)
+      return;
+  }
   g_sent.fetch_add(1, std::memory_order_relaxed);
 }
 
+void process_datagram(const uint8_t* buf, int n) {
+  if (n < int(kHeader)) return;
+  Header h{};
+  std::memcpy(&h, buf, kHeader);
+  if (std::memcmp(h.magic, kMagic, 4) != 0 || h.version != kVersion) {
+    g_bad.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  // Drop out-of-order and duplicate packets within a type. Reset on peer change or after >5 s
+  // silence so a restarted partner whose sequence numbers start at 1 is accepted immediately.
+  static uint16_t last_pad = 0, last_xform = 0;
+  const uint32_t prev_ms = g_last_pad_ms.load(std::memory_order_relaxed);
+  if (g_seq_reset.exchange(false, std::memory_order_relaxed) ||
+      (prev_ms && now_ms() - prev_ms > uint32_t(kPeerTimeout * 1000))) {
+    last_pad = 0;
+    last_xform = 0;
+    std::lock_guard lk(g_mu);
+    g_rx_edge_seq = 0;
+    g_rx_edge_bits = 0;
+    g_rx_edge_ttl = 0;
+    g_tx_edge_acked = 0;
+    g_tx_edges.clear();
+  }
+  if (h.type == kTypePad) {
+    if (n < int(kPadLen)) return;
+    if (int16_t(h.seq - last_pad) <= 0) {
+      g_dropped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    last_pad = h.seq;
+    PadPacket p{};
+    std::memcpy(&p, buf + kHeader, sizeof p);
+    {
+      std::lock_guard lk(g_mu);
+      g_pad.buttons = p.buttons;
+      g_pad.lx = p.lx;
+      g_pad.ly = p.ly;
+      g_pad.rx = p.rx;
+      g_pad.ry = p.ry;
+      g_pad.lt = p.lt;
+      g_pad.rt = p.rt;
+      if (p.edge_ack && (g_tx_edge_acked == 0 || int16_t(p.edge_ack - g_tx_edge_acked) > 0)) {
+        g_tx_edge_acked = p.edge_ack;
+        while (!g_tx_edges.empty() && int16_t(g_tx_edge_acked - g_tx_edges.front().seq) >= 0) {
+          g_tx_edges.pop_front();
+          g_edges_acked.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      if (p.edge_seq && (g_rx_edge_seq == 0 || int16_t(p.edge_seq - g_rx_edge_seq) > 0) && p.edge_buttons) {
+        g_rx_edge_seq = p.edge_seq;
+        g_rx_edge_bits |= p.edge_buttons;
+        g_rx_edge_ttl = 2;  // guarantee at least 2 game reads see brief rising-edge taps
+      }
+    }
+    g_last_pad_ms = now_ms();
+    g_recv.fetch_add(1, std::memory_order_relaxed);
+  } else if (h.type == kTypeTransform) {
+    if (n < int(kTransformLen)) return;
+    if (int16_t(h.seq - last_xform) <= 0) {
+      g_dropped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    last_xform = h.seq;
+    TransformPacket t{};
+    std::memcpy(&t, buf + kHeader, sizeof t);
+    {
+      std::lock_guard lk(g_mu);
+      g_xform.mission_tag = t.mission_tag;
+      std::memcpy(g_xform.position, t.position, sizeof t.position);
+      std::memcpy(g_xform.rotation, t.rotation, sizeof t.rotation);
+      std::memcpy(g_xform.velocity, t.velocity, sizeof t.velocity);
+      g_xform.ap = t.ap;
+      g_xform.apmax = t.apmax;
+      g_xform.has_pitch = std::isfinite(t.pitch) && std::fabs(t.pitch) <= 1.6f;
+      if (g_xform.has_pitch) g_xform.pitch = t.pitch;
+      g_xform.self_ap = t.self_ap;
+      g_xform.self_apmax = t.self_apmax;
+      g_xform.peer_pa = t.peer_pa;
+      g_xform.peer_pamax = t.peer_pamax;
+      g_xform.self_pa = t.self_pa;
+      g_xform.self_pamax = t.self_pamax;
+      g_xform.peer_en = t.peer_en;
+      g_xform.peer_enmax = t.peer_enmax;
+      g_xform.peer_en_redline = (t.flags & 2u) != 0;
+      g_xform.peer_wpn.active = t.peer_wpn_active;
+      g_xform.peer_wpn.purged = t.peer_wpn_purged;
+      std::memcpy(g_xform.peer_wpn.ammo, t.peer_ammo, sizeof t.peer_ammo);
+      g_xform.self_wpn_active = t.self_wpn_active;
+      g_xform.self_wpn_purged = t.self_wpn_purged;
+      g_xform.peer_paused = (t.flags & 1u) != 0;
+      ++g_xform.samples;
+    }
+    g_have_xform = true;
+    g_last_xform_ms = now_ms();
+    g_recv.fetch_add(1, std::memory_order_relaxed);
+  } else if (h.type >= 4 && h.type <= 6) {
+    g_last_pad_ms = now_ms();  // any session packet proves the peer is alive
+    g_recv.fetch_add(1, std::memory_order_relaxed);
+    rt::game::coopsession::on_packet(h.type, buf + kHeader, size_t(n) - kHeader);
+  } else if (h.type == kTypeSnapshot) {
+    // Records are absolute state, so a datagram that arrives late is still usable; only the
+    // sequence guard of the other types is skipped here.
+    if (n < int(kHeader + sizeof(SnapshotPayload))) return;
+    SnapshotPayload sp{};
+    std::memcpy(&sp, buf + kHeader, sizeof sp);
+    g_last_pad_ms = now_ms();
+    if (sp.epoch != rt::game::coopsession::epoch() || !rt::game::coopsession::linked_in_mission()) {
+      g_dropped.fetch_add(1, std::memory_order_relaxed);
+      return;  // a snapshot of another mission instance, or this side is not in the mission yet
+    }
+    const size_t avail = (size_t(n) - kHeader - sizeof sp) / sizeof(SnapshotRecordWire);
+    size_t count = sp.count;
+    if (count > avail) count = avail;
+    std::lock_guard lk(g_mu);
+    for (size_t i = 0; i < count; ++i) {
+      SnapshotRecordWire w{};
+      std::memcpy(&w, buf + kHeader + sizeof sp + i * sizeof w, sizeof w);
+      rt::game::coopnet::SnapshotRecord r{};
+      r.addr = w.addr;
+      r.entity_id = w.entity_id;
+      r.ord = w.ord;
+      r.broken_parts = w.broken_parts;
+      std::memcpy(r.position, w.position, sizeof r.position);
+      std::memcpy(r.rotation, w.rotation, sizeof r.rotation);
+      r.hp = w.hp;
+      if (g_snap_in.size() < 8192) g_snap_in.push_back(r);
+    }
+    g_snap_recv_recs.fetch_add(count, std::memory_order_relaxed);
+    if (sp.counter > g_snap_counter.load(std::memory_order_relaxed)) g_snap_counter = sp.counter;
+    g_snap_tag = sp.tag;
+    g_last_pad_ms = now_ms();  // a snapshot also proves the peer is alive
+    g_recv.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void receive_all() {
+  if (g_transport_steam) {
+    rt::game::coopsteam::pump([](uint64_t, const uint8_t* data, size_t len) {
+      if (rt::game::coopsteam::take_peer_changed()) g_seq_reset.store(true, std::memory_order_relaxed);
+      process_datagram(data, int(len));
+    });
+    if (rt::game::coopsteam::take_peer_changed()) g_seq_reset.store(true, std::memory_order_relaxed);
+    return;
+  }
   uint8_t buf[kMaxDatagram + 8];
   for (int i = 0; i < 128; ++i) {  // bounded: never spin on a busy socket
     sockaddr_in from{};
@@ -272,131 +427,7 @@ void receive_all() {
       std::lock_guard lk(g_mu);
       if (g_have_peer && (from.sin_addr.s_addr != g_peer.sin_addr.s_addr || from.sin_port != g_peer.sin_port)) continue;
     }
-    // Drop out-of-order and duplicate packets within a type. Reset on peer change or after >5 s
-    // silence so a restarted partner whose sequence numbers start at 1 is accepted immediately.
-    static uint16_t last_pad = 0, last_xform = 0;
-    const uint32_t prev_ms = g_last_pad_ms.load(std::memory_order_relaxed);
-    if (g_seq_reset.exchange(false, std::memory_order_relaxed) ||
-        (prev_ms && now_ms() - prev_ms > uint32_t(kPeerTimeout * 1000))) {
-      last_pad = 0;
-      last_xform = 0;
-      std::lock_guard lk(g_mu);
-      g_rx_edge_seq = 0;
-      g_rx_edge_bits = 0;
-      g_rx_edge_ttl = 0;
-      g_tx_edge_acked = 0;
-      g_tx_edges.clear();
-    }
-    if (h.type == kTypePad) {
-      if (n < int(kPadLen)) continue;
-      if (int16_t(h.seq - last_pad) <= 0) {
-        g_dropped.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
-      last_pad = h.seq;
-      PadPacket p{};
-      std::memcpy(&p, buf + kHeader, sizeof p);
-      {
-        std::lock_guard lk(g_mu);
-        g_pad.buttons = p.buttons;
-        g_pad.lx = p.lx;
-        g_pad.ly = p.ly;
-        g_pad.rx = p.rx;
-        g_pad.ry = p.ry;
-        g_pad.lt = p.lt;
-        g_pad.rt = p.rt;
-        if (p.edge_ack && (g_tx_edge_acked == 0 || int16_t(p.edge_ack - g_tx_edge_acked) > 0)) {
-          g_tx_edge_acked = p.edge_ack;
-          while (!g_tx_edges.empty() && int16_t(g_tx_edge_acked - g_tx_edges.front().seq) >= 0) {
-            g_tx_edges.pop_front();
-            g_edges_acked.fetch_add(1, std::memory_order_relaxed);
-          }
-        }
-        if (p.edge_seq && (g_rx_edge_seq == 0 || int16_t(p.edge_seq - g_rx_edge_seq) > 0) && p.edge_buttons) {
-          g_rx_edge_seq = p.edge_seq;
-          g_rx_edge_bits |= p.edge_buttons;
-          g_rx_edge_ttl = 2;  // guarantee at least 2 game reads see brief rising-edge taps
-        }
-      }
-      g_last_pad_ms = now_ms();
-      g_recv.fetch_add(1, std::memory_order_relaxed);
-    } else if (h.type == kTypeTransform) {
-      if (n < int(kTransformLen)) continue;
-      if (int16_t(h.seq - last_xform) <= 0) {
-        g_dropped.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
-      last_xform = h.seq;
-      TransformPacket t{};
-      std::memcpy(&t, buf + kHeader, sizeof t);
-      {
-        std::lock_guard lk(g_mu);
-        g_xform.mission_tag = t.mission_tag;
-        std::memcpy(g_xform.position, t.position, sizeof t.position);
-        std::memcpy(g_xform.rotation, t.rotation, sizeof t.rotation);
-        std::memcpy(g_xform.velocity, t.velocity, sizeof t.velocity);
-        g_xform.ap = t.ap;
-        g_xform.apmax = t.apmax;
-        g_xform.has_pitch = std::isfinite(t.pitch) && std::fabs(t.pitch) <= 1.6f;
-        if (g_xform.has_pitch) g_xform.pitch = t.pitch;
-        g_xform.self_ap = t.self_ap;
-        g_xform.self_apmax = t.self_apmax;
-        g_xform.peer_pa = t.peer_pa;
-        g_xform.peer_pamax = t.peer_pamax;
-        g_xform.self_pa = t.self_pa;
-        g_xform.self_pamax = t.self_pamax;
-        g_xform.peer_en = t.peer_en;
-        g_xform.peer_enmax = t.peer_enmax;
-        g_xform.peer_en_redline = (t.flags & 2u) != 0;
-        g_xform.peer_wpn.active = t.peer_wpn_active;
-        g_xform.peer_wpn.purged = t.peer_wpn_purged;
-        std::memcpy(g_xform.peer_wpn.ammo, t.peer_ammo, sizeof t.peer_ammo);
-        g_xform.self_wpn_active = t.self_wpn_active;
-        g_xform.self_wpn_purged = t.self_wpn_purged;
-        g_xform.peer_paused = (t.flags & 1u) != 0;
-        ++g_xform.samples;
-      }
-      g_have_xform = true;
-      g_last_xform_ms = now_ms();
-      g_recv.fetch_add(1, std::memory_order_relaxed);
-    } else if (h.type >= 4 && h.type <= 6) {
-      g_last_pad_ms = now_ms();  // any session packet proves the peer is alive
-      g_recv.fetch_add(1, std::memory_order_relaxed);
-      rt::game::coopsession::on_packet(h.type, buf + kHeader, size_t(n) - kHeader);
-    } else if (h.type == kTypeSnapshot) {
-      // Records are absolute state, so a datagram that arrives late is still usable; only the
-      // sequence guard of the other types is skipped here.
-      if (n < int(kHeader + sizeof(SnapshotPayload))) continue;
-      SnapshotPayload sp{};
-      std::memcpy(&sp, buf + kHeader, sizeof sp);
-      g_last_pad_ms = now_ms();
-      if (sp.epoch != rt::game::coopsession::epoch() || !rt::game::coopsession::linked_in_mission()) {
-        g_dropped.fetch_add(1, std::memory_order_relaxed);
-        continue;  // a snapshot of another mission instance, or this side is not in the mission yet
-      }
-      const size_t avail = (size_t(n) - kHeader - sizeof sp) / sizeof(SnapshotRecordWire);
-      size_t count = sp.count;
-      if (count > avail) count = avail;
-      std::lock_guard lk(g_mu);
-      for (size_t i = 0; i < count; ++i) {
-        SnapshotRecordWire w{};
-        std::memcpy(&w, buf + kHeader + sizeof sp + i * sizeof w, sizeof w);
-        rt::game::coopnet::SnapshotRecord r{};
-        r.addr = w.addr;
-        r.entity_id = w.entity_id;
-        r.ord = w.ord;
-        r.broken_parts = w.broken_parts;
-        std::memcpy(r.position, w.position, sizeof r.position);
-        std::memcpy(r.rotation, w.rotation, sizeof r.rotation);
-        r.hp = w.hp;
-        if (g_snap_in.size() < 8192) g_snap_in.push_back(r);
-      }
-      g_snap_recv_recs.fetch_add(count, std::memory_order_relaxed);
-      if (sp.counter > g_snap_counter.load(std::memory_order_relaxed)) g_snap_counter = sp.counter;
-      g_snap_tag = sp.tag;
-      g_last_pad_ms = now_ms();  // a snapshot also proves the peer is alive
-      g_recv.fetch_add(1, std::memory_order_relaxed);
-    }
+    process_datagram(buf, n);
   }
 }
 
@@ -405,56 +436,71 @@ void receive_all() {
 namespace rt::game::coopnet {
 
 bool init() {
-  if (g_started) return g_sock != INVALID_SOCKET;
+  if (g_started) return active();
   g_started = true;
-  char host[64]{}, join[128]{};
+  char host[64]{}, join[128]{}, steam_host[32]{}, steam_join[64]{};
+  bool want_steam_host = env("AC4_COOP_STEAM_HOST", steam_host, sizeof steam_host) && steam_host[0] != '0';
+  bool want_steam_join = env("AC4_COOP_STEAM_JOIN", steam_join, sizeof steam_join);
   bool want_host = env("AC4_COOP_HOST", host, sizeof host);
   bool want_join = env("AC4_COOP_JOIN", join, sizeof join);
-  if (!want_host && !want_join) return false;
+  if (!want_steam_host && !want_steam_join && !want_host && !want_join) return false;
 
-  WSADATA wsa{};
-  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-    LOG_E("coop", "COOP NET: WSAStartup failed; no link");
-    return false;
-  }
-  g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (g_sock == INVALID_SOCKET) {
-    LOG_E("coop", "COOP NET: socket() failed (%d); no link", WSAGetLastError());
-    return false;
-  }
-  u_long nonblocking = 1;
-  ioctlsocket(g_sock, FIONBIO, &nonblocking);
-
-  if (want_host) {
-    const unsigned port = unsigned(strtoul(host, nullptr, 10));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(uint16_t(port));
-    if (bind(g_sock, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == SOCKET_ERROR) {
-      LOG_E("coop", "COOP NET: bind udp/%u failed (%d); no link", port, WSAGetLastError());
-      closesocket(g_sock);
-      g_sock = INVALID_SOCKET;
+  if (want_steam_host || want_steam_join) {
+    uint64_t join_lid = 0;
+    if (want_steam_join && std::strcmp(steam_join, "auto") != 0 && std::strcmp(steam_join, "1") != 0) {
+      join_lid = std::strtoull(steam_join, nullptr, 10);
+    }
+    if (!rt::game::coopsteam::init(want_steam_host, join_lid)) {
+      LOG_E("coop", "COOP NET: Steam Spacewar transport failed to initialize; no link");
       return false;
     }
-    g_host = true;
-    LOG_I("coop", "COOP NET: host, listening on udp/%u (the peer is whoever sends first)", port);
+    g_transport_steam = true;
+    g_host = want_steam_host;
   } else {
-    sockaddr_in addr{};
-    if (!parse_endpoint(join, &addr)) {
-      LOG_E("coop", "COOP NET: bad AC4_COOP_JOIN '%s' (want ip:port); no link", join);
-      closesocket(g_sock);
-      g_sock = INVALID_SOCKET;
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+      LOG_E("coop", "COOP NET: WSAStartup failed; no link");
       return false;
     }
-    {
-      std::lock_guard lk(g_mu);
-      g_peer = addr;
-      g_have_peer = true;
+    g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_sock == INVALID_SOCKET) {
+      LOG_E("coop", "COOP NET: socket() failed (%d); no link", WSAGetLastError());
+      return false;
     }
-    char ip[64] = {};
-    inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof ip);
-    LOG_I("coop", "COOP NET: joining %s:%u", ip, unsigned(ntohs(addr.sin_port)));
+    u_long nonblocking = 1;
+    ioctlsocket(g_sock, FIONBIO, &nonblocking);
+
+    if (want_host) {
+      const unsigned port = unsigned(strtoul(host, nullptr, 10));
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = htonl(INADDR_ANY);
+      addr.sin_port = htons(uint16_t(port));
+      if (bind(g_sock, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == SOCKET_ERROR) {
+        LOG_E("coop", "COOP NET: bind udp/%u failed (%d); no link", port, WSAGetLastError());
+        closesocket(g_sock);
+        g_sock = INVALID_SOCKET;
+        return false;
+      }
+      g_host = true;
+      LOG_I("coop", "COOP NET: host, listening on udp/%u (the peer is whoever sends first)", port);
+    } else {
+      sockaddr_in addr{};
+      if (!parse_endpoint(join, &addr)) {
+        LOG_E("coop", "COOP NET: bad AC4_COOP_JOIN '%s' (want ip:port); no link", join);
+        closesocket(g_sock);
+        g_sock = INVALID_SOCKET;
+        return false;
+      }
+      {
+        std::lock_guard lk(g_mu);
+        g_peer = addr;
+        g_have_peer = true;
+      }
+      char ip[64] = {};
+      inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof ip);
+      LOG_I("coop", "COOP NET: joining %s:%u", ip, unsigned(ntohs(addr.sin_port)));
+    }
   }
   char sim_buf[32]{};
   if (env("AC4_COOP_SIM_LATENCY_MS", sim_buf, sizeof sim_buf)) {
@@ -466,7 +512,20 @@ bool init() {
   return true;
 }
 
-bool active() { return g_sock != INVALID_SOCKET; }
+void shutdown() {
+  if (g_transport_steam) {
+    rt::game::coopsteam::shutdown();
+    g_transport_steam = false;
+  }
+  if (g_sock != INVALID_SOCKET) {
+    closesocket(g_sock);
+    g_sock = INVALID_SOCKET;
+  }
+}
+
+bool active() { return g_transport_steam ? rt::game::coopsteam::active() : (g_sock != INVALID_SOCKET); }
+bool transport_steam() { return g_transport_steam && rt::game::coopsteam::active(); }
+std::string transport_status() { return g_transport_steam ? rt::game::coopsteam::status_label() : std::string(); }
 
 bool role_host() { return active() && g_host; }
 bool role_join() { return active() && !g_host; }
@@ -837,8 +896,8 @@ void report() {
   Transform t;
   const bool have = remote_transform(&t);
   const bool peer = peer_present();
-  LOG_I("coop", "COOP NET: %s | sent %llu recv %llu dropped %llu bad %llu | edges %llu/%llu | peer %s | pad age %u ms | xform %s, error %.2f | snap sent %llu rec in %llu pkt, recv %llu rec",
-        g_host ? "host" : "join", (unsigned long long)g_sent.load(), (unsigned long long)g_recv.load(),
+  LOG_I("coop", "COOP NET: %s (%s) | sent %llu recv %llu dropped %llu bad %llu | edges %llu/%llu | peer %s | pad age %u ms | xform %s, error %.2f | snap sent %llu rec in %llu pkt, recv %llu rec",
+        g_host ? "host" : "join", g_transport_steam ? "steam" : "udp", (unsigned long long)g_sent.load(), (unsigned long long)g_recv.load(),
         (unsigned long long)g_dropped.load(), (unsigned long long)g_bad.load(),
         (unsigned long long)g_edges_acked.load(), (unsigned long long)g_edges_sent.load(),
         peer ? "UP" : "down",
