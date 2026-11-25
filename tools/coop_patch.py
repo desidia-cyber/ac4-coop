@@ -19,7 +19,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bnd3tool as T  # noqa: E402
 
-ROOT = r"G:\Freespace\Armored Core 4 (USA)\coop-mod"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DISC = os.path.join(ROOT, r"disc\PS3_GAME\USRDIR\bind\world")
 OUT = os.path.join(ROOT, r"payload\overlay_coop")
 KILL_TIMER = 492  # test aid only (AC4_COOP_TEST_AUTOKILL)
