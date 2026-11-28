@@ -172,6 +172,7 @@ std::unordered_map<std::string, std::deque<std::string>> g_sub_q;
 std::unordered_map<std::string, uint32_t> g_sub_counts;  // deterministic "<script>#<n>" instance ids
 uint32_t g_rx_next = 1;
 uint32_t g_rx_contig = 0;
+uint32_t g_replayed_count = 0;
 
 void dispatch_rx_locked() {
   while (true) {
@@ -692,7 +693,6 @@ int lua_command(ppu::Ctx& ctx, u32 L, const std::string& cmd) {
     {
       std::lock_guard lk(g_mu);
       if (ep) {
-        if (!g_events.empty() && g_events.back() == wire) return 0;
         g_events.push_back(wire);
         seq = uint32_t(g_events.size());
         g_sent_upto = seq;
@@ -716,6 +716,7 @@ int lua_command(ppu::Ctx& ctx, u32 L, const std::string& cmd) {
       if (it != g_sub_q.end() && !it->second.empty()) {
         out = std::move(it->second.front());
         it->second.pop_front();
+        ++g_replayed_count;
         have = true;
       }
     }
@@ -735,6 +736,7 @@ int lua_command(ppu::Ctx& ctx, u32 L, const std::string& cmd) {
       if (!g_main_q.empty()) {
         out = std::move(g_main_q.front());
         g_main_q.pop_front();
+        ++g_replayed_count;
         have = true;
       }
     }
@@ -824,6 +826,7 @@ void reset_rx() {
   g_sub_counts.clear();
   g_rx_next = 1;
   g_rx_contig = 0;
+  g_replayed_count = 0;
 }
 
 // f_007cca94(flow, mission index, r5, r6): a player starts a sortie from the mission screen.
@@ -1238,6 +1241,7 @@ void on_packet(uint8_t type, const uint8_t* p, size_t n) {
       g_sub_q.clear();
       g_rx_next = 1;
       g_rx_contig = 0;
+      g_replayed_count = 0;
       LOG_W("coop", "COOP SESSION: join adopts the host's epoch %u for mission record 0x%08x", w.epoch, w.key);
     }
     return;
@@ -1334,7 +1338,7 @@ void frame() {
         if (g_at_stats.active && g_at_stats.ever_played) {
           snap = g_at_stats;
           hev = uint32_t(g_events.size());
-          jrep = g_rx_next > 0 ? (g_rx_next - 1) : 0;
+          jrep = g_replayed_count;
           g_at_stats.active = false;
           flush = true;
         }
@@ -1518,7 +1522,7 @@ bool autotest_pad_override(uint32_t port, uint16_t* d1, uint16_t* d2, uint8_t* l
   }
 
   // Phase B: Hub at rest — hands off! host_autotest_tick / autostart_tick launch missions directly.
-  if (in_hub && g_phase.load() == kMenu && !in_sortie) return false;
+  if (in_hub && !in_sortie) return false;
 
   // Phase C: Active gameplay — Joiner injects a deterministic 5 s movement/combat/weapon-switch test.
   if (linked_in_mission() && running) {

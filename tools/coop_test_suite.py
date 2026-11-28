@@ -76,12 +76,22 @@ def build_jobs(args):
     return jobs
 
 
-def kill_ac4():
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "ac4.exe"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+def kill_pair(procs):
+    for p in procs:
+        if p is None:
+            continue
+        try:
+            if p.poll() is None:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
     time.sleep(0.5)
 
 
@@ -108,7 +118,6 @@ def read_jsonl(path):
 
 
 def launch_pair(queue_path, host_report, join_report, port):
-    kill_ac4()
     base_env = os.environ.copy()
     base_env["AC4_COOP_AUTOTEST"] = "1"
     base_env["AC4_COOP_DUMP"] = "0"
@@ -286,7 +295,7 @@ def main():
                 need_restart = True
                 break
 
-        kill_ac4()
+        kill_pair((p_host, p_join))
         if not need_restart:
             break
 

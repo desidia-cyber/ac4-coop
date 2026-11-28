@@ -1048,7 +1048,7 @@ void hook_unit_ai(Ctx& ctx, void (*orig)(Ctx&)) {
     const u32 owner = r32(unit + 8);
     const u32 state = r32(unit + 24);
     if (owner >= 0x10000000u && state >= 0x10000000u) {
-      rt::game::coop_entities_note_input_state(owner, state, false);
+      rt::game::coop_entities_note_input_state(owner, state, false, unit);
       if (rt::game::coopnet::role_join() && rt::game::coop_entities_apply_input_state(owner, state)) {
         return;
       }

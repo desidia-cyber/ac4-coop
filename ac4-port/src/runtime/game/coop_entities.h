@@ -76,7 +76,7 @@ size_t coop_entities_drain_hp_sync(HpSyncJob* out, size_t max);
 // Tier 1 & Tier 2 enemy micro-animation & NEXT sync:
 // Registers an actor entity's InputState* (from hook_unit_ai / hook_ac_turn_input), and marks
 // verified AC/NEXT actors (from hook_ac_turn_input) for pitch/PA/weapon sync.
-void coop_entities_note_input_state(u32 entity, u32 state, bool is_ac);
+void coop_entities_note_input_state(u32 entity, u32 state, bool is_ac, u32 unit = 0);
 // Join: if Host has synced InputState for `entity`, writes it into `state` (+0..+12, +24..+48)
 // and returns true (caller may skip local AI decision-making).
 bool coop_entities_apply_input_state(u32 entity, u32 state);

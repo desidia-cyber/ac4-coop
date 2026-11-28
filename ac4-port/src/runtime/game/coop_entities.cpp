@@ -527,10 +527,30 @@ std::vector<u32> g_pending_kills;
 std::vector<rt::game::PartBreakJob> g_pending_parts;
 std::unordered_map<u32, float> g_pending_hp;
 std::vector<u32> g_pending_enemy_purges;
+struct EntInputRef {
+  u32 unit = 0;   // AI unit object (unit+8 == entity, unit+24 == state) when known
+  u32 state = 0;  // InputState*
+};
 std::mutex g_ent_input_mu;
-std::unordered_map<u32, u32> g_ent_input;           // entity -> InputState*
+std::unordered_map<u32, EntInputRef> g_ent_input;   // entity -> {unit, InputState*}
 std::unordered_set<u32> g_ent_is_ac;                // verified AC/NEXT actors (from hook_ac_turn_input)
 std::unordered_map<u32, SyncedInput> g_synced_in;   // Join: entity -> latest Host InputState
+
+u32 validate_input_ref(u32 entity, const EntInputRef& ref) {
+  if (ref.state < kEntAddrFloor || !rt::vm::committed(ref.state, 52)) return 0;
+  if (ref.unit) {
+    if (ref.unit < kEntAddrFloor || !rt::vm::committed(ref.unit + 28, 4)) return 0;
+    if (r32(ref.unit + 8) != entity || r32(ref.unit + 24) != ref.state) return 0;
+  }
+  return ref.state;
+}
+
+void prune_dead_entity_input(u32 entity) {
+  std::lock_guard lk(g_ent_input_mu);
+  g_ent_input.erase(entity);
+  g_ent_is_ac.erase(entity);
+  g_synced_in.erase(entity);
+}
 uint64_t g_kills_queued_total = 0;
 std::mutex g_dead_mu;
 std::unordered_set<u32> g_host_dead;
@@ -753,14 +773,22 @@ void snapshot_publish() {
     r.wpn_active = 0xff;
     r.pitch = NAN;
     r.pa = -1.0f;
-    {
-      u32 in_state = 0;
+    const bool dead = std::isfinite(r.hp) && r.hp <= 0.0f;
+    if (dead) {
+      prune_dead_entity_input(a);
+    } else {
+      EntInputRef ref{};
       bool is_ac = false;
       {
         std::lock_guard lk(g_ent_input_mu);
         auto it_in = g_ent_input.find(a);
-        if (it_in != g_ent_input.end()) in_state = it_in->second;
+        if (it_in != g_ent_input.end()) ref = it_in->second;
         is_ac = (g_ent_is_ac.count(a) != 0);
+      }
+      const u32 in_state = validate_input_ref(a, ref);
+      if (ref.state && !in_state) {
+        std::lock_guard lk(g_ent_input_mu);
+        g_ent_input.erase(a);
       }
       if (in_state && read_input_state(in_state, r.in_btn, r.in_axes)) r.ext_flags |= 1u;
       if (is_ac && read_enemy_ac_state(a, &r.pitch, &r.pa, &r.wpn_active, &r.wpn_purged)) r.ext_flags |= 2u;
@@ -768,7 +796,6 @@ void snapshot_publish() {
 
     // Bandwidth culling: send immediately when moving, rotating, damaged, sub-part state changed,
     // firing/boosting/weapon-switching/PA-changing, or newly dead (5x); stationary refresh at ~1 Hz.
-    const bool dead = std::isfinite(r.hp) && r.hp <= 0.0f;
     auto it = g_sent.find(a);
     bool send_now = (it == g_sent.end());
     if (!send_now) {
@@ -925,6 +952,7 @@ void snapshot_apply() {
     const bool dead = std::isfinite(t.hp) && t.hp <= 0.0f;
     const bool have_copy4 = rt::vm::committed(addr + 0x190, 0x40);
     if (dead) {
+      prune_dead_entity_input(addr);
       const float local_hp = float(ppu::rf32(addr + kEntHp));
       if (!t.death_queued) {
         t.death_queued = true;
@@ -974,13 +1002,18 @@ void snapshot_apply() {
     }
     // Tier 1 & Tier 2: re-assert Host enemy InputState and enemy NEXT pitch/PA/weapons every frame.
     if (t.ext_flags & 3u) {
-      u32 in_state = 0;
+      EntInputRef ref{};
       bool is_ac = false;
       {
         std::lock_guard lk(g_ent_input_mu);
         auto it_in = g_ent_input.find(addr);
-        if (it_in != g_ent_input.end()) in_state = it_in->second;
+        if (it_in != g_ent_input.end()) ref = it_in->second;
         is_ac = (g_ent_is_ac.count(addr) != 0);
+      }
+      const u32 in_state = validate_input_ref(addr, ref);
+      if (ref.state && !in_state) {
+        std::lock_guard lk(g_ent_input_mu);
+        g_ent_input.erase(addr);
       }
       if ((t.ext_flags & 1u) && in_state) write_input_state(in_state, t.in_btn, t.in_axes);
       if ((t.ext_flags & 2u) && is_ac) apply_enemy_ac_state(addr, t);
@@ -1099,6 +1132,7 @@ void coop_entities_note_dead(u32 addr) {
   const u32 b1 = rt::game::coop_body(1), b2 = rt::game::coop_body(2);
   const u32 eid = r32(addr + kEntId);
   if (addr == b1 || addr == b2 || eid == 1000u || eid == 1001u) return;
+  prune_dead_entity_input(addr);
   std::lock_guard lk(g_dead_mu);
   if (g_host_dead.insert(addr).second && g_host_dead_logs < 30) {
     ++g_host_dead_logs;
@@ -1135,7 +1169,7 @@ size_t coop_entities_drain_hp_sync(HpSyncJob* out, size_t max) {
   return n;
 }
 
-void coop_entities_note_input_state(u32 entity, u32 state, bool is_ac) {
+void coop_entities_note_input_state(u32 entity, u32 state, bool is_ac, u32 unit) {
   if (entity < kEntAddrFloor || state < kEntAddrFloor) return;
   const u32 b1 = rt::game::coop_body(1), b2 = rt::game::coop_body(2);
   if (entity == b1 || entity == b2) return;
@@ -1143,7 +1177,14 @@ void coop_entities_note_input_state(u32 entity, u32 state, bool is_ac) {
   const u32 eid = r32(entity + kEntId);
   if (eid == 1000u || eid == 1001u) return;
   std::lock_guard lk(g_ent_input_mu);
-  g_ent_input[entity] = state;
+  auto& ref = g_ent_input[entity];
+  if (unit) {
+    ref.unit = unit;
+    ref.state = state;
+  } else if (ref.state != state) {
+    ref.unit = 0;
+    ref.state = state;
+  }
   if (is_ac) g_ent_is_ac.insert(entity);
 }
 

@@ -27,7 +27,7 @@
 namespace {
 
 constexpr char kMagic[4] = {'A', 'C', '4', 'C'};
-constexpr uint8_t kVersion = 1;
+constexpr uint8_t kVersion = 2;
 constexpr uint8_t kTypePad = 1;
 constexpr uint8_t kTypeTransform = 2;
 constexpr uint8_t kTypeSnapshot = 3;
