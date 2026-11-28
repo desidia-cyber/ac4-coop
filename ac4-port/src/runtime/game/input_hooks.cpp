@@ -21,6 +21,7 @@
 #include "runtime/datawatch.h"
 #include "runtime/game/coop_body.h"
 #include "runtime/game/coop_build.h"
+#include "runtime/game/coop_entities.h"
 #include "runtime/game/coop_net.h"
 #include "runtime/game/coop_session.h"
 #include "runtime/game/create_hooks.h"
@@ -1040,6 +1041,19 @@ void hook_unit_ai(Ctx& ctx, void (*orig)(Ctx&)) {
   u32 unit = u32(ctx.r[3]);
   bool target = p2_freeze_unit(unit);
   if (target) p2_refresh_pad();
+  // Tier 1 enemy micro-animation sync: register (owner_entity -> InputState*) for every AI unit;
+  // on Joiner, when Host has synced InputState for this enemy, inject Host's action/fire/move/aim
+  // inputs directly and skip local AI decision-making.
+  if (rt::game::coopnet::active() && unit >= 0x10000000u && rt::vm::committed(unit + 24, 4)) {
+    const u32 owner = r32(unit + 8);
+    const u32 state = r32(unit + 24);
+    if (owner >= 0x10000000u && state >= 0x10000000u) {
+      rt::game::coop_entities_note_input_state(owner, state, false);
+      if (rt::game::coopnet::role_join() && rt::game::coop_entities_apply_input_state(owner, state)) {
+        return;
+      }
+    }
+  }
   if (unit && ai_freeze_on() && unit != rt::game::coop_body(1) && unit != rt::game::coop_body(2)) {
     static int logged = 0;
     static std::set<u32> seen;
@@ -1091,6 +1105,23 @@ void player_state_dump(u32 state) {
 // each way (the scale of the mouse stick; kept in between).
 void hook_ac_turn_input(Ctx& ctx, void (*orig)(Ctx&)) {
   u32 obj = note_turn_input(ctx);
+  if (rt::game::coopnet::active()) {
+    const u32 ctl = u32(ctx.r[3]), input = u32(ctx.r[4]);
+    if (ctl >= 0x10000000u && input >= 0x10000000u && rt::vm::committed(input + 12, 4) && rt::vm::committed(ctl + 4, 4)) {
+      const u32 state = r32(input + 12);
+      const u32 a = r32(ctl + 4);
+      if (a >= 0x10000000u && rt::vm::committed(a + 152, 4)) {
+        const u32 b = r32(a + 152);
+        if (b >= 0x10000000u && rt::vm::committed(b + 260, 4)) {
+          const u32 ac_obj = r32(b + 260);
+          if (ac_obj >= 0x10000000u && rt::vm::committed(ac_obj + 4, 4)) {
+            const u32 body = r32(ac_obj + 4);
+            rt::game::coop_entities_note_input_state(body, state, true);
+          }
+        }
+      }
+    }
+  }
   if (g_p2_dump) { u32 t = g_p2_unit.load(std::memory_order_relaxed); if (t && rt::vm::committed(t + 24, 4)) player_state_dump(r32(t + 24)); }
   survey_ac_input(ctx);
   orig(ctx);

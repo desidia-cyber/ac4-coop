@@ -60,9 +60,10 @@ void set_local_peer_ap(float ap, float apmax);
 void set_local_peer_pa(float pa, float pamax);
 void set_local_peer_en(float en, float enmax, bool redline);
 void set_local_peer_weapons(const WeaponSyncState& w);
-// The AP/PA & active/purged weapons of this instance's OWN AC1 (sent to the partner for Partner HUD
-// and visual weapon sync on AC2).
+// The AP/PA/EN & active/purged weapons of this instance's OWN AC1 (sent to the partner for Partner
+// HUD, visual weapon sync, and accurate EN/PA/boost animation state on AC2).
 void set_local_self_vitals(float ap, float apmax, float pa, float pamax);
+void set_local_self_en(float en, float enmax, bool redline);
 void set_local_self_weapons(uint8_t active, uint8_t purged);
 // The local player AC's vertical look pitch in radians (from look control +48, so mouse vertical aim
 // replicates to the partner's AC2 even though mouse pitch bypasses the right stick).
@@ -107,10 +108,18 @@ struct SnapshotRecord {
   uint32_t addr;
   uint32_t entity_id;     // stable mission entity id (*(addr + 4)), immune to heap address shifts
   uint16_t ord;           // rank among non-player entities
-  uint16_t broken_parts;  // bitmask of destroyed sub-parts (entity+0x2b0 durability array, cur_hp <= 0)
+  uint32_t part_state;    // 2 bits per sub-part (up to 16 parts): 0=>50%, 1=<=50%, 2=<=30%, 3=broken (<=0)
   float position[3];
   float rotation[9];      // rows of the body's 4x4 at +0x10/+0x20/+0x30
   float hp;               // +0x2a4
+  // Tier 1 (all AI units) & Tier 2 (enemy NEXTs): action/fire input state, aim pitch, PA, weapons.
+  uint8_t ext_flags;      // bit 0: has_input (in_btn/in_axes valid), bit 1: has_ac (pitch/pa/wpn valid)
+  uint8_t wpn_active;     // low nibble: R active idx, high nibble: L active idx (0xf=n/a)
+  uint8_t wpn_purged;     // bits 0..5: purged holders
+  int8_t in_axes[5];      // quantized [-127..127] move_x(+24), move_z(+28), turn(+32), vert(+36), pitch(+48)
+  uint32_t in_btn[4];     // InputState +0, +4, +8, +12 (boost, QB, OB, AA, fire R/L/back/shoulder)
+  float pitch;            // enemy NEXT LookControl +48 (radians)
+  float pa;               // enemy NEXT PrimalArmorObject +724 (current PA)
 };
 
 // Host: send `n` records as one snapshot. Returns the number of datagrams sent (0 when not the host).
@@ -146,6 +155,9 @@ struct Transform {
   float peer_en = 0.0f;   // sender's AC2 EN (host -> join authoritative EN)
   float peer_enmax = 0.0f;
   bool peer_en_redline = false;
+  float self_en = 0.0f;   // sender's own AC1 EN (for accurate partner boost/OB animations on AC2)
+  float self_enmax = 0.0f;
+  bool self_en_redline = false;
   WeaponSyncState peer_wpn{};
   uint8_t self_wpn_active = 0xff;
   uint8_t self_wpn_purged = 0;

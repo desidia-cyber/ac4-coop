@@ -61,7 +61,7 @@ if __COOP_RT == nil then
 	-- local engine state (s28g: OnAllDestroyed read a different "KamikazeDeads" on each side).
 	R.qorig = {}
 	function R.isquery( k )
-		return type( k ) == "string" and ( string.find( k, "^Get" ) or string.find( k, "^Is" ) or string.find( k, "^Difficulty" ) ) ~= nil
+		return type( k ) == "string" and ( string.find( k, "^Get" ) or string.find( k, "^Is" ) or string.find( k, "^Difficulty" ) or string.find( k, "^Random" ) ) ~= nil
 	end
 	function R.qwrap( f, name )
 		return function( ... )
@@ -336,6 +336,26 @@ if __COOP_RT == nil then
 			if R.role == "host" and kp1 ~= nil and ak == nil and kp == nil and who ~= "2" then
 				SetTimerWithHandler( eventOperation, %(killtimer)d, kp1, "__CoopKillP1" )
 			end
+			-- test aid (host, autotest smoke): completes mission cleanly after delay to verify full loop
+			local ats = tonumber( print( "\1Cflag\2autotest_succeed" ) or "" )
+			if R.role == "host" and ats ~= nil and ak == nil and kp == nil and kp1 == nil and who ~= "2" then
+				SetTimerWithHandler( eventOperation, %(killtimer)d, ats, "__CoopTestSucceed" )
+			end
+		end
+	end
+	function __CoopTestSucceed( eventOperation )
+		print( "\1Clog\2autotest: firing mission success" )
+		if type( SetMissionResult_Success ) == "function" then
+			SetMissionResult_Success( eventOperation, 0 )
+		else
+			eventOperation:SetMissionResult( 1 )
+		end
+		if type( OnMissionSuccess ) == "function" then
+			OnMissionSuccess( eventOperation )
+		elseif type( MissionSuccess ) == "function" then
+			MissionSuccess( eventOperation, 0 )
+		else
+			eventOperation:SetMissionEndingFlowCAPEvent( 1 )
 		end
 	end
 	function __CoopFallbackDead( eventOperation )
@@ -379,10 +399,160 @@ end
 if __COOP_RT.role == "host" or __COOP_RT.role == "join" then
 	for _, n in ipairs( { %(names)s } ) do __COOP_RT.wrap( n ) end
 	__COOP_RT.wrap( "__CoopFallbackFail" )
+	__COOP_RT.wrap( "__CoopTestSucceed" )
 	__COOP_RT.install_initial()
 	print( "\1Clog\2queries: " .. __COOP_RT.wrapq_globals() .. " global function(s)" )
 end
 -- ===== end of the co-op runtime =====
+'''
+
+SUB_RUNTIME = r'''
+
+-- ===== AC4 CO-OP SUB-SCRIPT RUNTIME (tools/coop_patch.py) =====
+if __COOP_SRT == nil then
+	__COOP_SRT = {}
+	local R = __COOP_SRT
+	R.role = print( "\1Crole" )
+	R.depth = 0
+	R.orig = {}
+	R.qorig = {}
+	R.eo = nil
+	R.sid = nil
+	local function ser( v )
+		local t = type( v )
+		if t == "number" then return "n" .. tostring( v )
+		elseif t == "string" then return "s" .. v
+		elseif t == "boolean" then if v then return "b1" else return "b0" end
+		elseif t == "nil" then return "z"
+		end
+		return "u"
+	end
+	local function des( s )
+		local c = string.sub( s, 1, 1 )
+		local r = string.sub( s, 2 )
+		if c == "n" then return tonumber( r )
+		elseif c == "s" then return r
+		elseif c == "b" then return r == "1"
+		elseif c == "z" then return nil
+		end
+		return R.eo
+	end
+	local function split( s, sep )
+		local out = {}
+		if s == nil or s == "" then return out end
+		local i = 1
+		while true do
+			local j = string.find( s, sep, i, 1 )
+			if j == nil then table.insert( out, string.sub( s, i ) ); break end
+			table.insert( out, string.sub( s, i, j - 1 ) )
+			i = j + 1
+		end
+		return out
+	end
+	function R.qwrap( f )
+		return function( ... )
+			if R.depth == 0 or R.inq then return f( unpack( arg ) ) end
+			if R.rq ~= nil then
+				R.rqi = R.rqi + 1
+				local v = R.rq[ R.rqi ]
+				if v ~= nil and v ~= "u" then return des( v ) end
+			end
+			R.inq = true
+			local ok, r = pcall( f, unpack( arg ) )
+			R.inq = false
+			if not ok then error( r, 0 ) end
+			if R.q ~= nil then table.insert( R.q, ser( r ) ) end
+			return r
+		end
+	end
+	function R.wrapq_rng()
+		for _, k in ipairs( { "RandomRangeInt", "RandomRangeFloat", "DifficultyIsNormal" } ) do
+			if type( _G[ k ] ) == "function" and R.qorig[ k ] == nil then
+				R.qorig[ k ] = _G[ k ]
+				_G[ k ] = R.qwrap( _G[ k ] )
+			end
+		end
+		if type( math ) == "table" and type( math.random ) == "function" and R.qorig[ "math.random" ] == nil then
+			R.qorig[ "math.random" ] = math.random
+			math.random = R.qwrap( math.random )
+		end
+	end
+	function R.wrap( name )
+		local f = _G[ name ]
+		if type( f ) ~= "function" or R.orig[ name ] ~= nil then return end
+		R.orig[ name ] = f
+		_G[ name ] = function( ... )
+			if R.depth > 0 then return f( unpack( arg ) ) end
+			if type( arg[ 1 ] ) == "userdata" then R.eo = arg[ 1 ] end
+			if R.role == "join" then return end
+			local s = name
+			for i = 1, arg.n do s = s .. "\2" .. ser( arg[ i ] ) end
+			R.depth = 1
+			R.q = {}
+			print( "\1Chbeg" )
+			local r = { pcall( f, unpack( arg ) ) }
+			print( "\1Chend" )
+			R.depth = 0
+			if R.sid ~= nil then
+				print( "\1Csev\2" .. R.sid .. "\2" .. s .. "\3" .. table.concat( R.q, "\2" ) )
+			end
+			R.q = nil
+			if not r[ 1 ] then error( r[ 2 ], 0 ) end
+			table.remove( r, 1 )
+			return unpack( r )
+		end
+	end
+	function __CoopSubPoll( eventOperation )
+		R.eo = eventOperation
+		if R.poll_cmd ~= nil then
+			for k = 1, 64 do
+				local s = print( R.poll_cmd )
+				if s == nil then break end
+				local cut = string.find( s, "\3", 1, 1 )
+				local head, tail = s, ""
+				if cut ~= nil then head = string.sub( s, 1, cut - 1 ); tail = string.sub( s, cut + 1 ) end
+				local fields = split( head, "\2" )
+				local name = fields[ 1 ]
+				local f = R.orig[ name ]
+				if f == nil then f = _G[ name ] end
+				if type( f ) == "function" then
+					local a = { n = table.getn( fields ) - 1 }
+					for m = 2, table.getn( fields ) do a[ m - 1 ] = des( fields[ m ] ) end
+					R.rq = split( tail, "\2" )
+					R.rqi = 0
+					R.depth = 1
+					print( "\1Chbeg" )
+					local ok, err = pcall( f, unpack( a ) )
+					print( "\1Chend" )
+					R.depth = 0
+					R.rq = nil
+					if not ok then print( "\1Clog\2sub replay " .. tostring( R.sid ) .. ":" .. tostring( name ) .. " failed: " .. tostring( err ) ) end
+				end
+			end
+		end
+		SetTimerWithHandler( eventOperation, %(timer)d, 0.15, "__CoopSubPoll" )
+	end
+	function R.install_initial()
+		local init = _G[ "Initial" ]
+		if type( init ) ~= "function" or R.init_done then return end
+		R.init_done = true
+		_G[ "Initial" ] = function( eventOperation )
+			R.eo = eventOperation
+			R.sid = print( "\1Csid\2%(script)s" )
+			if R.sid ~= nil then R.poll_cmd = "\1Cspoll\2" .. R.sid end
+			init( eventOperation )
+			if R.role == "join" then
+				SetTimerWithHandler( eventOperation, %(timer)d, 0.15, "__CoopSubPoll" )
+			end
+		end
+	end
+end
+if __COOP_SRT.role == "host" or __COOP_SRT.role == "join" then
+	for _, n in ipairs( { %(names)s } ) do __COOP_SRT.wrap( n ) end
+	__COOP_SRT.install_initial()
+	__COOP_SRT.wrapq_rng()
+end
+-- ===== end of the co-op sub-script runtime =====
 '''
 
 
@@ -467,6 +637,37 @@ def patch_mission(mid, out_root):
                 flags=re.S,
             )
             edits += n4
+        # Inject lean host-authoritative event-replay runtime ONLY into non-player chara/*.lua and
+        # obj/*.lua scripts that perform animations/CAP/fades/gauges/RNG from non-message triggers
+        # (keeping the shared PS3 DLLua heap lean; pure user-message scripts already sync via mXXX.lua).
+        is_sub = (
+            ("/event/mission/chara/" in name and not name.endswith("_player.lua"))
+            or ("/event/mission/obj/" in name)
+        )
+        if is_sub and "AC4 CO-OP SUB-SCRIPT RUNTIME" not in new_txt:
+            stripped = re.sub(r"--\[\[.*?\]\]", "", new_txt, flags=re.S)
+            stripped = re.sub(r"--[^\n]*", "", stripped)
+            has_action = any(k in stripped for k in (
+                "SetAnime", "PauseAnime", "RestartAnime", "SetCapEvent", "SetFadeScene",
+                "ShowEventGauge", "SetCameraShake", "SetEnableTree", "KillConstraintEntity",
+                "RandomRange", "math.random",
+            ))
+            has_async_trigger = any(k in stripped for k in (
+                "RandomRange", "math.random", "ON_PARTS_DURABILITY_REMAINDER_",
+                "ON_DECREASE_DURABILITY_MYSELF", "ON_OVER_PROGRESS_CURR_ANIME",
+                "ON_END_OF_CURRENT_ANIME", "ObserveRegion", "WatchSharedGlobalValue",
+            ))
+            sub_names = handlers(raw)
+            has_init = re.search(r"^\s*function\s+Initial\s*\(", stripped, flags=re.M) is not None
+            if has_action and has_async_trigger and sub_names and has_init:
+                script_id = os.path.basename(name)
+                sub_code = SUB_RUNTIME % {
+                    "timer": POLL_TIMER,
+                    "script": script_id,
+                    "names": ", ".join('"%s"' % n for n in sub_names),
+                }
+                new_txt = new_txt + sub_code.replace("\n", "\r\n")
+                edits += 1
         if new_txt != txt:
             e["data"] = bytearray(new_txt.encode("cp932", errors="surrogateescape"))
     if edits == 0:

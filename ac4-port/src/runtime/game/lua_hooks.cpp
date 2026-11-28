@@ -3,6 +3,7 @@
 #include <string>
 
 #include "ppu/ppu_recomp.h"
+#include "runtime/game/coop_session.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
 
@@ -34,6 +35,7 @@ void hook_lua_throw(Ctx& ctx, void (*orig)(Ctx&)) {
       }
     }
     LOG_W("lua", "script error %u (status %u, from 0x%08x): %s", n, status, u32(ctx.lr), msg.c_str());
+    rt::game::coopsession::note_lua_error(msg);
   }
   orig(ctx);
 }

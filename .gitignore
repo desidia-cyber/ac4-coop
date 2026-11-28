@@ -26,6 +26,7 @@
 /run/data/
 /run/data2/
 /run/data3/
+/run/autotest/
 /run/shots/
 /run/logs/
 /run/save_*/

@@ -5,12 +5,16 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "ppu/ppu_recomp.h"
@@ -21,6 +25,7 @@
 #include "runtime/game/coop_session.h"
 #include "runtime/game/frame_policy.h"
 #include "runtime/game/key_assign.h"
+#include "runtime/game/menu_mouse.h"
 #include "runtime/gpu/window.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
@@ -30,6 +35,7 @@ void f_007cca94(ppu::Ctx&);  // the mission screen's sortie start (hooked: sorti
 void f_009723e0(ppu::Ctx&);  // MissionParamTable* getter (used by f_007ce2e4)
 void f_00972da0(ppu::Ctx&);  // MissionParamEntry* lookup(table, index): r16(entry + 2) == mission number
 void f_00b0e4d8(ppu::Ctx&);  // SetMissionResult (vtable 0x101463c0 slot 0x88)
+void f_00b0e2bc(ppu::Ctx&);  // SetMissionCAPEvent (vtable 0x101463c0 slot 0x38)
 void f_00b0e2e4(ppu::Ctx&);  // SetMissionEndingFlowCAPEvent (vtable 0x101463c0 slot 0x3c)
 void f_00b0ebe0(ppu::Ctx&);  // SetMissionMode (vtable 0x101463c0 slot 0x100)
 void f_00b0e718(ppu::Ctx&);  // SetEnableImmortal (vtable 0x101463c0 slot 0x114)
@@ -158,16 +164,145 @@ std::vector<std::string> g_events;
 double g_last_resend = -1e9;
 uint32_t g_sent_upto = 0;  // highest seq sent at least once
 
-// Join: received events by seq, the next one the script takes, and the contiguous high-water mark.
+// Join: received events by seq, demuxed into main (mXXX.lua) and per-instance sub-script
+// (chara/*.lua, obj/*.lua) FIFO queues as soon as contiguous seqs arrive.
 std::map<uint32_t, std::string> g_rx;
+std::deque<std::string> g_main_q;
+std::unordered_map<std::string, std::deque<std::string>> g_sub_q;
+std::unordered_map<std::string, uint32_t> g_sub_counts;  // deterministic "<script>#<n>" instance ids
 uint32_t g_rx_next = 1;
 uint32_t g_rx_contig = 0;
+
+void dispatch_rx_locked() {
+  while (true) {
+    auto it = g_rx.find(g_rx_next);
+    if (it == g_rx.end()) break;
+    std::string ev = std::move(it->second);
+    g_rx.erase(it);
+    ++g_rx_next;
+    if (ev.size() > 3 && ev[0] == '\1' && ev[1] == 'S' && ev[2] == '\2') {
+      const size_t sep = ev.find('\2', 3);
+      if (sep != std::string::npos) {
+        g_sub_q[ev.substr(3, sep - 3)].push_back(ev.substr(sep + 1));
+      }
+    } else {
+      g_main_q.push_back(std::move(ev));
+    }
+  }
+}
 
 double g_last_lobby = -1e9;
 double g_body_gone_since = -1;
 std::string g_title;
 uint64_t g_polls_sec = 0, g_events_sec = 0;
 double g_last_stat = -1e9;
+
+// --- Automated multi-mission co-op test harness (AC4_COOP_AUTOTEST=1) -------------------------
+struct TestJob {
+  int mission = 0;
+  int hard = 0;
+  std::string scenario = "smoke";  // smoke | killp1 | killp2 | autokill
+  double hold_s = 7.0;
+};
+struct TestStats {
+  bool active = false;
+  bool ever_played = false;
+  uint16_t epoch = 0;
+  int mission = -1;
+  int hard = 0;
+  std::string scenario;
+  double sortie_t0 = 0;
+  double barrier_s = 0;
+  double playing_t0 = -1;
+  bool barrier_ok = false;
+  bool design_ok = false;
+  bool p1_ok = false;
+  bool p2_ok = false;
+  bool has_p2_origin = false;
+  double p2_origin[3] = {};
+  double p2_max_disp = 0;
+  size_t max_enemies = 0;
+  uint32_t lua_errors = 0;
+  std::string first_lua_err;
+};
+
+std::once_flag g_at_init_once;
+bool g_at_on = false;
+std::string g_at_report_path;
+std::vector<TestJob> g_at_queue;
+size_t g_at_idx = 0;
+bool g_at_has_cur = false;
+TestJob g_at_cur;
+bool g_at_suite_done_logged = false;
+double g_at_hub_ready_since = -1;
+TestStats g_at_stats;
+
+std::string json_escape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (unsigned char c : s) {
+    if (c == '"' || c == '\\') {
+      out.push_back('\\');
+      out.push_back(char(c));
+    } else if (c >= 0x20 && c < 0x7f) {
+      out.push_back(char(c));
+    } else {
+      out.push_back(' ');
+    }
+  }
+  return out;
+}
+
+void at_init() {
+  std::call_once(g_at_init_once, [] {
+    const char* v = std::getenv("AC4_COOP_AUTOTEST");
+    g_at_on = (v && v[0] == '1');
+    if (!g_at_on) return;
+    if (const char* rp = std::getenv("AC4_COOP_TEST_REPORT"); rp && *rp) g_at_report_path = rp;
+    if (const char* qp = std::getenv("AC4_COOP_TEST_QUEUE"); qp && *qp) {
+      std::ifstream in(qp);
+      std::string line;
+      while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (size_t h = line.find('#'); h != std::string::npos) line.resize(h);
+        std::istringstream ls(line);
+        TestJob j;
+        if (!(ls >> j.mission)) continue;
+        if (ls >> j.hard) {
+          if (ls >> j.scenario) {
+            double hs = 0;
+            if (ls >> hs && hs > 0) j.hold_s = hs;
+          }
+        }
+        g_at_queue.push_back(j);
+      }
+      LOG_W("coop", "COOP AUTOTEST: loaded %zu mission job(s) from %s", g_at_queue.size(), qp);
+    }
+    LOG_W("coop", "COOP AUTOTEST: enabled (report=%s)", g_at_report_path.empty() ? "-" : g_at_report_path.c_str());
+  });
+}
+
+void at_write_line(const std::string& json_line) {
+  if (g_at_report_path.empty()) return;
+  std::ofstream out(g_at_report_path, std::ios::app);
+  if (out) {
+    out << json_line << "\n";
+    out.flush();
+  }
+}
+
+bool is_on_mission_screen() {
+  const std::string scenes = rt::game::live_scenes();
+  if (scenes.find("MissionSelectScene") == std::string::npos) return false;
+  for (size_t a = 0; a < scenes.size();) {
+    size_t b = scenes.find(',', a);
+    if (b == std::string::npos) b = scenes.size();
+    const std::string n = scenes.substr(a, b - a);
+    if (!n.empty() && n != "MissionSelectScene" && n != "TitleAfterInitScene") return false;
+    a = b + 1;
+  }
+  return true;
+}
 
 double now_s() { return rt::log_time(); }
 
@@ -447,6 +582,9 @@ void exec_native_player_event(ppu::Ctx& ctx, const std::string& payload) {
   if (kind == "res") {
     fn = f_00b0e4d8;
     slot = 0x88;
+  } else if (kind == "cap") {
+    fn = f_00b0e2bc;
+    slot = 0x38;
   } else if (kind == "end") {
     fn = f_00b0e2e4;
     slot = 0x3c;
@@ -537,17 +675,66 @@ int lua_command(ppu::Ctx& ctx, u32 L, const std::string& cmd) {
       LOG_I("coop", "COOP EV host #%u epoch %u: %s", seq, ep, rest.substr(0, 160).c_str());
     return 0;
   }
+  if (verb == "sid") {  // chara/obj sub-script deterministic instance id ("<script>#<n>")
+    std::string sid;
+    {
+      std::lock_guard lk(g_mu);
+      const uint32_t idx = ++g_sub_counts[rest];
+      sid = ac4::strprintf("%s#%u", rest.c_str(), idx);
+    }
+    return lua_return_string(ctx, L, sid);
+  }
+  if (verb == "sev") {  // host: a chara/obj sub-script handler ran
+    if (!host()) return 0;
+    const uint16_t ep = g_epoch.load();
+    uint32_t seq = 0;
+    const std::string wire = "\1S\2" + rest;
+    {
+      std::lock_guard lk(g_mu);
+      if (ep) {
+        if (!g_events.empty() && g_events.back() == wire) return 0;
+        g_events.push_back(wire);
+        seq = uint32_t(g_events.size());
+        g_sent_upto = seq;
+      }
+      ++g_events_sec;
+    }
+    if (seq) send_event(ep, seq, wire);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 2000)
+      LOG_I("coop", "COOP SUBEV host #%u epoch %u: %s", seq, ep, rest.substr(0, 160).c_str());
+    return 0;
+  }
+  if (verb == "spoll") {  // join: next host event for this chara/obj sub-script instance
+    std::string out;
+    bool have = false;
+    {
+      std::lock_guard lk(g_mu);
+      ++g_polls_sec;
+      dispatch_rx_locked();
+      auto it = g_sub_q.find(rest);
+      if (it != g_sub_q.end() && !it->second.empty()) {
+        out = std::move(it->second.front());
+        it->second.pop_front();
+        have = true;
+      }
+    }
+    if (!have) return 0;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 2000)
+      LOG_I("coop", "COOP SUBEV join replays [%s]: %s", rest.c_str(), out.substr(0, 140).c_str());
+    return lua_return_string(ctx, L, out);
+  }
   if (verb == "poll") {  // join: the next host event, if any
     std::string out;
     bool have = false;
     {
       std::lock_guard lk(g_mu);
       ++g_polls_sec;
-      auto it = g_rx.find(g_rx_next);
-      if (it != g_rx.end()) {
-        out = it->second;
-        g_rx.erase(it);
-        ++g_rx_next;
+      dispatch_rx_locked();
+      if (!g_main_q.empty()) {
+        out = std::move(g_main_q.front());
+        g_main_q.pop_front();
         have = true;
       }
     }
@@ -561,21 +748,32 @@ int lua_command(ppu::Ctx& ctx, u32 L, const std::string& cmd) {
     return 0;
   }
   if (verb == "flag") {  // test switches from the environment, e.g. "autokill" = AC4_COOP_TEST_AUTOKILL
+    at_init();
     if (rest == "autokill" && host() && g_kill_epoch.load() != g_epoch.load()) {
+      if (g_at_on && g_at_has_cur && g_at_cur.scenario == "autokill")
+        return lua_return_string(ctx, L, ac4::strprintf("%.1f", g_at_cur.hold_s));
       const char* v = std::getenv("AC4_COOP_TEST_AUTOKILL");
       if (v && *v) return lua_return_string(ctx, L, v);
     }
     // "killp2" = AC4_COOP_TEST_KILLP2=<seconds>: the host kills the second player's body (entity
     // 1001) once, to exercise the second player's death path (research\28, s28z5)
     if (rest == "killp2" && host()) {
+      if (g_at_on && g_at_has_cur && g_at_cur.scenario == "killp2")
+        return lua_return_string(ctx, L, ac4::strprintf("%.1f", g_at_cur.hold_s));
       const char* v = std::getenv("AC4_COOP_TEST_KILLP2");
       if (v && *v) return lua_return_string(ctx, L, v);
     }
     // "killp1" = AC4_COOP_TEST_KILLP1=<seconds>: the host kills player 1 (entity 1000) once,
     // to exercise host-death replication (including unpatched m080-m380 player chara scripts).
     if (rest == "killp1" && host()) {
+      if (g_at_on && g_at_has_cur && g_at_cur.scenario == "killp1")
+        return lua_return_string(ctx, L, ac4::strprintf("%.1f", g_at_cur.hold_s));
       const char* v = std::getenv("AC4_COOP_TEST_KILLP1");
       if (v && *v) return lua_return_string(ctx, L, v);
+    }
+    if (rest == "autotest_succeed" && host()) {
+      if (g_at_on && g_at_has_cur && g_at_cur.scenario == "smoke")
+        return lua_return_string(ctx, L, ac4::strprintf("%.1f", g_at_cur.hold_s));
     }
     if (rest == "has_result") {
       const uint16_t ep = g_epoch.load(std::memory_order_relaxed);
@@ -621,6 +819,9 @@ uint16_t new_epoch() {
 void reset_rx() {
   std::lock_guard lk(g_mu);
   g_rx.clear();
+  g_main_q.clear();
+  g_sub_q.clear();
+  g_sub_counts.clear();
   g_rx_next = 1;
   g_rx_contig = 0;
 }
@@ -632,41 +833,60 @@ void reset_rx() {
 //         only marks the join ready, and the host's start later starts it (autostart_tick).
 bool on_sortie_start(ppu::Ctx& ctx) {
   if (!net::active()) return true;
+  at_init();
   if (host()) {
     // Optional rig test aid: AC4_COOP_TEST_MISSION=<3-digit mission num, e.g. 80, 290, 350, 490>
-    // and AC4_COOP_TEST_HARD=1 override the mission launched from the hub so any mission can be
-    // live-tested on a fresh save. Complete no-op when unset.
-    if (const char* tm = std::getenv("AC4_COOP_TEST_MISSION"); tm && *tm) {
-      const int want = std::atoi(tm);
-      if (want >= 0 && want <= 999) {
-        u64 saved_r[14];
-        for (int i = 0; i < 14; ++i) saved_r[i] = ctx.r[i];
-        const u64 saved_lr = ctx.lr;
-        f_009723e0(ctx);
-        const u32 tbl = u32(ctx.r[3]);
-        int found = -1;
-        for (int idx = 0; idx < 120 && tbl; ++idx) {
-          ctx.r[2] = saved_r[2];
-          ctx.r[3] = tbl;
-          ctx.r[4] = u64(idx);
-          f_00972da0(ctx);
-          const u32 ent = u32(ctx.r[3]);
-          if (ent && rt::vm::committed(ent, 4) && int(ppu::r16(ent + 2)) == want) {
-            found = idx;
-            break;
-          }
+    // and AC4_COOP_TEST_HARD=1 (or AC4_COOP_AUTOTEST=1 queue) override the mission launched from
+    // the hub so any mission can be live-tested on a fresh save. Complete no-op when unset.
+    int want = -1;
+    int want_hard = -1;
+    if (g_at_on && g_at_has_cur) {
+      want = g_at_cur.mission;
+      want_hard = g_at_cur.hard;
+    } else if (const char* tm = std::getenv("AC4_COOP_TEST_MISSION"); tm && *tm) {
+      want = std::atoi(tm);
+    }
+    if (want >= 0 && want <= 999) {
+      u64 saved_r[14];
+      for (int i = 0; i < 14; ++i) saved_r[i] = ctx.r[i];
+      const u64 saved_lr = ctx.lr;
+      f_009723e0(ctx);
+      const u32 tbl = u32(ctx.r[3]);
+      int found = -1;
+      for (int idx = 0; idx < 120 && tbl; ++idx) {
+        ctx.r[2] = saved_r[2];
+        ctx.r[3] = tbl;
+        ctx.r[4] = u64(idx);
+        f_00972da0(ctx);
+        const u32 ent = u32(ctx.r[3]);
+        if (ent && rt::vm::committed(ent, 4) && int(ppu::r16(ent + 2)) == want) {
+          found = idx;
+          break;
         }
-        for (int i = 0; i < 14; ++i) ctx.r[i] = saved_r[i];
-        ctx.lr = saved_lr;
-        if (found >= 0) {
-          LOG_W("coop", "COOP TEST: overriding sortie mission index %u -> %d (m%03d)", u32(ctx.r[4]), found, want);
-          ctx.r[4] = u64(found);
-        } else {
-          LOG_W("coop", "COOP TEST: mission m%03d not found in MissionParam table", want);
+      }
+      for (int i = 0; i < 14; ++i) ctx.r[i] = saved_r[i];
+      ctx.lr = saved_lr;
+      if (found >= 0) {
+        LOG_W("coop", "COOP TEST: overriding sortie mission index %u -> %d (m%03d)", u32(ctx.r[4]), found, want);
+        ctx.r[4] = u64(found);
+      } else {
+        LOG_W("coop", "COOP TEST: mission m%03d not found in MissionParam table", want);
+        if (g_at_on && g_at_has_cur) {
+          at_write_line(ac4::strprintf(
+              "{\"event\":\"mission\",\"role\":\"host\",\"mission\":%d,\"hard\":%d,\"scenario\":\"%s\",\"status\":\"not_in_table\"}",
+              g_at_cur.mission, g_at_cur.hard, json_escape(g_at_cur.scenario).c_str()));
+          g_at_has_cur = false;
+          g_at_hub_ready_since = -1;
+          return false;
         }
       }
     }
-    if (const char* th = std::getenv("AC4_COOP_TEST_HARD"); th && th[0] == '1') {
+    if (want_hard == 1) {
+      LOG_W("coop", "COOP TEST: overriding sortie difficulty -> HARD (r5=1)");
+      ctx.r[5] = 1;
+    } else if (want_hard == 0) {
+      ctx.r[5] = 0;
+    } else if (const char* th = std::getenv("AC4_COOP_TEST_HARD"); th && th[0] == '1') {
       LOG_W("coop", "COOP TEST: overriding sortie difficulty -> HARD (r5=1)");
       ctx.r[5] = 1;
     }
@@ -677,7 +897,17 @@ bool on_sortie_start(ppu::Ctx& ctx) {
     {
       std::lock_guard lk(g_mu);
       g_events.clear();
+      g_sub_counts.clear();
       g_sent_upto = 0;
+      if (g_at_on) {
+        g_at_stats = TestStats{};
+        g_at_stats.active = true;
+        g_at_stats.epoch = ep;
+        g_at_stats.mission = g_at_has_cur ? g_at_cur.mission : -1;
+        g_at_stats.hard = g_at_has_cur ? g_at_cur.hard : int(s32(ctx.r[5]));
+        g_at_stats.scenario = g_at_has_cur ? g_at_cur.scenario : "manual";
+        g_at_stats.sortie_t0 = now_s();
+      }
     }
     g_key = mine;
     g_mission = 0;
@@ -715,6 +945,16 @@ bool on_sortie_start(ppu::Ctx& ctx) {
     g_join_played = p.epoch;
     g_phase = cs::kSortie;
     g_join_ready = false;
+    if (g_at_on) {
+      std::lock_guard lk(g_mu);
+      g_at_stats = TestStats{};
+      g_at_stats.active = true;
+      g_at_stats.epoch = p.epoch;
+      g_at_stats.mission = int(p.mission);
+      g_at_stats.hard = int(int8_t((p.key >> 16) & 0xffu));
+      g_at_stats.scenario = "join";
+      g_at_stats.sortie_t0 = now_s();
+    }
     LOG_W("coop", "COOP SESSION: join starts the host's sortie index %u, epoch %u%s", p.key & 0xffff, p.epoch,
           t_in_autostart ? " (automatic)" : "");
     send_lobby();
@@ -788,6 +1028,54 @@ void autostart_tick(ppu::Ctx& ctx, u32 flow) {
   g_autostart_pending = true;
 }
 
+// Host autotest queue driver: launches the next queued mission directly from MissionSelectScene
+// once both Host and Joiner are at rest in kMenu, without touching the hub UI.
+void host_autotest_tick(ppu::Ctx& ctx, u32 flow) {
+  (void)ctx;
+  at_init();
+  if (!g_at_on || !host() || !net::active() || g_phase.load() != cs::kMenu || !net::peer_present()) {
+    g_at_hub_ready_since = -1;
+    return;
+  }
+  if (g_autostart_pending || g_at_has_cur) return;
+  bool stats_active = false;
+  Peer p;
+  {
+    std::lock_guard lk(g_mu);
+    p = g_peer;
+    stats_active = g_at_stats.active;
+  }
+  if (stats_active || p.phase != cs::kMenu || !is_on_mission_screen()) {
+    g_at_hub_ready_since = -1;
+    return;
+  }
+  if (!rt::vm::committed(flow, 128) || r32(flow) != kFlowVt) return;
+  const u32 sortie = r32(flow + kFlowSortie);
+  if (!sortie || !rt::vm::committed(sortie, 8) || r32(sortie) != kSortieVt) return;
+  const double t = now_s();
+  if (g_at_hub_ready_since < 0) {
+    g_at_hub_ready_since = t;
+    return;
+  }
+  if (t - g_at_hub_ready_since < 2.0) return;
+  if (g_at_idx >= g_at_queue.size()) {
+    if (!g_at_suite_done_logged) {
+      g_at_suite_done_logged = true;
+      LOG_W("coop", "COOP AUTOTEST: all %zu queued mission(s) completed", g_at_queue.size());
+      at_write_line(ac4::strprintf("{\"event\":\"suite_done\",\"role\":\"host\",\"total\":%zu}", g_at_queue.size()));
+    }
+    return;
+  }
+  g_at_cur = g_at_queue[g_at_idx++];
+  g_at_has_cur = true;
+  g_at_hub_ready_since = -1;
+  LOG_W("coop", "COOP AUTOTEST: launching [%zu/%zu] m%03d hard=%d scenario=%s hold=%.1fs from flow 0x%08x",
+        g_at_idx, g_at_queue.size(), g_at_cur.mission, g_at_cur.hard, g_at_cur.scenario.c_str(), g_at_cur.hold_s, flow);
+  g_autostart_flow = flow;
+  g_autostart_key = key_encode(0, g_at_cur.hard ? 1 : 0, 1);
+  g_autostart_pending = true;
+}
+
 void autostart_call(ppu::Ctx& ctx, u32 flow, u32 key) {
   Peer p;
   p.key = key;
@@ -834,6 +1122,8 @@ void reset_mission_objects() {
   g_player_obj[1].store(0, std::memory_order_relaxed);
   g_player_obj[2].store(0, std::memory_order_relaxed);
   g_lua_handler_depth.store(0, std::memory_order_relaxed);
+  std::lock_guard lk(g_mu);
+  g_sub_counts.clear();
 }
 
 void note_scene_init() {
@@ -845,6 +1135,7 @@ void note_scene_init() {
     {
       std::lock_guard lk(g_mu);
       g_events.clear();
+      g_sub_counts.clear();
       g_sent_upto = 0;
     }
     g_epoch = ep;
@@ -943,6 +1234,8 @@ void on_packet(uint8_t type, const uint8_t* p, size_t n) {
       g_epoch = w.epoch;
       g_join_played = w.epoch;
       g_rx.clear();
+      g_main_q.clear();
+      g_sub_q.clear();
       g_rx_next = 1;
       g_rx_contig = 0;
       LOG_W("coop", "COOP SESSION: join adopts the host's epoch %u for mission record 0x%08x", w.epoch, w.key);
@@ -959,6 +1252,7 @@ void on_packet(uint8_t type, const uint8_t* p, size_t n) {
     if (w.seq < g_rx_next) return;                    // already taken by the script
     g_rx.emplace(w.seq, std::string(reinterpret_cast<const char*>(p + sizeof w), w.len));
     while (g_rx_contig + 1 < g_rx_next || g_rx.count(g_rx_contig + 1)) ++g_rx_contig;
+    dispatch_rx_locked();
     return;
   }
   if (type == kTypeDesign) {
@@ -990,6 +1284,7 @@ void on_packet(uint8_t type, const uint8_t* p, size_t n) {
 
 void frame() {
   if (!net::active()) return;
+  at_init();
   const double t = now_s();
   if (t - g_last_lobby > 0.2) send_lobby();
   if (host() && t - g_last_resend > 0.25) {
@@ -999,6 +1294,69 @@ void frame() {
   sync_peer_key_assignment();
   phase_watchdog();
   update_title();
+  if (g_at_on) {
+    if (linked_in_mission() && rt::game::mission_running()) {
+      const u32 b1 = rt::game::coop_body(1);
+      const u32 b2 = rt::game::coop_body(2);
+      double p2pos[3] = {};
+      const bool got_pos = rt::game::coop_body_position(host() ? 2 : 1, p2pos);
+      u32 ebuf[256];
+      const size_t nent = rt::game::coop_entity_addrs(ebuf, 256);
+      std::lock_guard lk(g_mu);
+      if (g_at_stats.active) {
+        g_at_stats.ever_played = true;
+        if (g_at_stats.playing_t0 < 0) g_at_stats.playing_t0 = t;
+        if (g_mission.load() > 0 && g_at_stats.mission <= 0) g_at_stats.mission = int(g_mission.load());
+        if (b1) g_at_stats.p1_ok = true;
+        if (b2) g_at_stats.p2_ok = true;
+        if (nent > g_at_stats.max_enemies) g_at_stats.max_enemies = nent;
+        if (got_pos && (t - g_at_stats.playing_t0) >= 0.4) {
+          if (!g_at_stats.has_p2_origin) {
+            g_at_stats.has_p2_origin = true;
+            g_at_stats.p2_origin[0] = p2pos[0];
+            g_at_stats.p2_origin[1] = p2pos[1];
+            g_at_stats.p2_origin[2] = p2pos[2];
+          } else {
+            const double dx = p2pos[0] - g_at_stats.p2_origin[0];
+            const double dy = p2pos[1] - g_at_stats.p2_origin[1];
+            const double dz = p2pos[2] - g_at_stats.p2_origin[2];
+            const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (d > g_at_stats.p2_max_disp) g_at_stats.p2_max_disp = d;
+          }
+        }
+      }
+    } else if (g_phase.load() == kMenu && is_on_mission_screen() && !rt::game::scene_alive("Ac4SortieScene")) {
+      TestStats snap;
+      uint32_t hev = 0, jrep = 0;
+      bool flush = false;
+      {
+        std::lock_guard lk(g_mu);
+        if (g_at_stats.active && g_at_stats.ever_played) {
+          snap = g_at_stats;
+          hev = uint32_t(g_events.size());
+          jrep = g_rx_next > 0 ? (g_rx_next - 1) : 0;
+          g_at_stats.active = false;
+          flush = true;
+        }
+      }
+      if (flush) {
+        if (host()) g_at_has_cur = false;
+        const bool res_ok = (g_result_epoch.load() == snap.epoch);
+        const double total_s = t - snap.sortie_t0;
+        const std::string line = ac4::strprintf(
+            "{\"event\":\"mission\",\"role\":\"%s\",\"mission\":%d,\"hard\":%d,\"scenario\":\"%s\",\"epoch\":%u,"
+            "\"status\":\"completed\",\"total_s\":%.1f,\"barrier_ok\":%s,\"barrier_s\":%.1f,\"design_ok\":%s,"
+            "\"p1_ok\":%s,\"p2_ok\":%s,\"p2_disp\":%.2f,\"max_enemies\":%zu,\"host_events\":%u,\"join_replayed\":%u,"
+            "\"result_synced\":%s,\"lua_errors\":%u,\"first_lua_err\":\"%s\"}",
+            host() ? "host" : "join", snap.mission, snap.hard, json_escape(snap.scenario).c_str(), snap.epoch,
+            total_s, snap.barrier_ok ? "true" : "false", snap.barrier_s, snap.design_ok ? "true" : "false",
+            snap.p1_ok ? "true" : "false", snap.p2_ok ? "true" : "false", snap.p2_max_disp, snap.max_enemies,
+            hev, jrep, res_ok ? "true" : "false", snap.lua_errors, json_escape(snap.first_lua_err).c_str());
+        LOG_W("coop", "COOP AUTOTEST RESULT: %s", line.c_str());
+        at_write_line(line);
+      }
+    }
+  }
   if (t - g_last_stat > 5.0) {
     g_last_stat = t;
     uint64_t polls, evs;
@@ -1058,6 +1416,8 @@ void load_barrier() {
   double last_seen = t0;
   double both_at = -1.0;
   double esc_since = -1.0;
+  bool barrier_succeeded = false;
+  bool design_succeeded = false;
   for (;;) {
     net::pump();
     const uint16_t ep = g_epoch.load();  // a join that came first adopts the host's epoch meanwhile
@@ -1073,7 +1433,11 @@ void load_barrier() {
     const double t = now_s();
     if (peer_ready) {
       if (both_at < 0.0) both_at = t;
-      if (designs_done || (t - both_at > 5.0)) break;
+      if (designs_done || (t - both_at > 5.0)) {
+        barrier_succeeded = true;
+        design_succeeded = designs_done;
+        break;
+      }
     }
     if (net::peer_present()) {
       ever_seen = true;
@@ -1102,9 +1466,114 @@ void load_barrier() {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   g_phase = kPlaying;
+  if (g_at_on) {
+    std::lock_guard lk(g_mu);
+    if (g_at_stats.active) {
+      g_at_stats.barrier_ok = barrier_succeeded;
+      g_at_stats.design_ok = design_succeeded;
+      g_at_stats.barrier_s = now_s() - t0;
+      if (g_mission.load() > 0 && g_at_stats.mission <= 0) g_at_stats.mission = int(g_mission.load());
+    }
+  }
   send_lobby();
   LOG_W("coop", "COOP BARRIER: both ready after %.1f s; mission %03u epoch %u starts", now_s() - t0, g_mission.load(),
         g_epoch.load());
+}
+
+bool autotest_enabled() {
+  at_init();
+  return g_at_on;
+}
+
+void note_lua_error(const std::string& msg) {
+  at_init();
+  if (!g_at_on) return;
+  std::lock_guard lk(g_mu);
+  if (g_at_stats.active) {
+    ++g_at_stats.lua_errors;
+    if (g_at_stats.first_lua_err.empty()) g_at_stats.first_lua_err = msg.substr(0, 200);
+  }
+}
+
+bool autotest_pad_override(uint32_t port, uint16_t* d1, uint16_t* d2, uint8_t* lx, uint8_t* ly, uint8_t* rx, uint8_t* ry) {
+  at_init();
+  if (!g_at_on || port != 0 || !d1 || !d2 || !lx || !ly || !rx || !ry) return false;
+  constexpr uint16_t kStart = 0x8;
+  constexpr uint16_t kL2 = 0x1, kR1 = 0x8, kTri = 0x10, kCross = 0x40;
+  const double t = now_s();
+  const bool in_hub = is_on_mission_screen();
+  const bool in_sortie = rt::game::scene_alive("Ac4SortieScene");
+  const bool running = rt::game::mission_running();
+
+  // Phase A: Boot -> Title Menu -> LOAD GAME -> MissionSelectScene.
+  if (!rt::game::scene_alive("MissionSelectScene") && !in_sortie) {
+    if (rt::game::input_context() == rt::game::InputContext::Menu) {
+      // Title menu defaults to LOAD GAME: pulse Cross every 1.8 s.
+      if (std::fmod(t, 1.8) < 0.15) *d2 |= kCross;
+    } else {
+      // Attract movies / title card / startup screens: pulse Start every 1.0 s.
+      if (std::fmod(t, 1.0) < 0.15) *d1 |= kStart;
+    }
+    return true;
+  }
+
+  // Phase B: Hub at rest — hands off! host_autotest_tick / autostart_tick launch missions directly.
+  if (in_hub && g_phase.load() == kMenu && !in_sortie) return false;
+
+  // Phase C: Active gameplay — Joiner injects a deterministic 5 s movement/combat/weapon-switch test.
+  if (linked_in_mission() && running) {
+    if (!join()) return false;
+    double t0 = -1;
+    {
+      std::lock_guard lk(g_mu);
+      if (g_at_stats.active) t0 = g_at_stats.playing_t0;
+    }
+    if (t0 < 0) return false;
+    const double dt = t - t0;
+    if (dt >= 0.5 && dt < 2.5) {
+      *ly = 20;  // forward (PS3 Y axis points down: 0 = full forward)
+      *d2 |= kL2;  // boost
+      return true;
+    }
+    if (dt >= 2.5 && dt < 4.0) {
+      *rx = 225;  // turn right
+      *d2 |= kR1;  // fire right arm
+      return true;
+    }
+    if (dt >= 4.0 && dt < 4.25) {
+      *d2 |= kTri;  // weapon switch rising edge
+      return true;
+    }
+    if (dt >= 4.3 && dt < 5.5) {
+      *lx = 225;  // strafe right
+      *ly = 40;   // forward
+      return true;
+    }
+    return false;
+  }
+
+  // Phase D: Briefing (skip after 2.5 s) or Ending/Debriefing (advance back to hub).
+  bool ever_played = false;
+  double sortie_t0 = 0;
+  {
+    std::lock_guard lk(g_mu);
+    ever_played = g_at_stats.ever_played;
+    sortie_t0 = g_at_stats.sortie_t0;
+  }
+  if (in_sortie && !ever_played) {
+    // Briefing movie / BATTLE START banner: pulse Start/Cross after 2.5 s.
+    if (t - sortie_t0 > 2.5) {
+      const double phase = std::fmod(t, 1.2);
+      if (phase < 0.15) *d1 |= kStart;
+      else if (phase >= 0.6 && phase < 0.75) *d2 |= kCross;
+    }
+    return true;
+  }
+  // Ending cutscene / Debriefing / Rank / Reward screens: pulse Cross (and periodic Start).
+  const double phase = std::fmod(t, 0.8);
+  if (phase < 0.15) *d2 |= kCross;
+  else if (std::fmod(t, 2.4) >= 1.2 && std::fmod(t, 2.4) < 1.35) *d1 |= kStart;
+  return true;
 }
 
 }  // namespace rt::game::coopsession
@@ -1281,11 +1750,16 @@ void hook_menu_tick(Ctx& ctx, void (*orig)(Ctx&)) {
       rt::game::coopnet::role_host() && rt::vm::committed(scene, 8) && r32(scene) == 0x10142638u) {
     rt::game::coop_entities_note_dead(scene);
   }
-  if (!rt::game::coopnet::role_join() || !rt::vm::committed(scene, 4) || r32(scene) != kMissionListVt) return;
-  static std::atomic<int> n{0};
+  if (!rt::vm::committed(scene, 4) || r32(scene) != kMissionListVt) return;
   const u32 flow = g_flow.load();
-  if (n.fetch_add(1) < 2) LOG_I("coop", "COOP FLOW mission list 0x%08x ticking (flow 0x%08x)", scene, flow);
-  if (flow) autostart_tick(ctx, flow);
+  if (!flow) return;
+  if (rt::game::coopnet::role_join()) {
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 2) LOG_I("coop", "COOP FLOW mission list 0x%08x ticking (flow 0x%08x)", scene, flow);
+    autostart_tick(ctx, flow);
+  } else if (rt::game::coopnet::role_host() && rt::game::coopsession::autotest_enabled()) {
+    host_autotest_tick(ctx, flow);
+  }
 }
 
 // The per-player object's player actions (vtable 0x101463c0 slots 0x38 SetMissionCAPEvent, 0x3c
@@ -1323,16 +1797,13 @@ static void native_event_gate(Ctx& ctx, void (*orig)(Ctx&), const char* kind, co
   if (!t_in_native_exec && rt::game::coopsession::linked_in_mission() &&
       g_lua_handler_depth.load(std::memory_order_relaxed) == 0) {
     const u32 a4 = u32(ctx.r[4]), a5 = u32(ctx.r[5]);
-    const bool replicate = (std::strcmp(kind, "mode") != 0) || (a5 == 0);
-    if (replicate) {
-      if (join() && block_on_join) {
-        static std::atomic<int> blocked{0};
-        if (blocked.fetch_add(1, std::memory_order_relaxed) < 20)
-          LOG_W("coop", "COOP NATIVE: blocked local chara-script %s(r4=%u, r5=%u) on join (waiting for host)", what, a4, a5);
-        return;
-      }
-      if (host()) publish_native_event(kind, a4, a5);
+    if (join() && block_on_join) {
+      static std::atomic<int> blocked{0};
+      if (blocked.fetch_add(1, std::memory_order_relaxed) < 20)
+        LOG_W("coop", "COOP NATIVE: blocked local chara-script %s(r4=%u, r5=%u) on join (waiting for host)", what, a4, a5);
+      return;
     }
+    if (host()) publish_native_event(kind, a4, a5);
   }
   if (is_end_or_res && rt::game::coopsession::linked_in_mission()) {
     const uint16_t ep = g_epoch.load(std::memory_order_relaxed);
@@ -1341,7 +1812,9 @@ static void native_event_gate(Ctx& ctx, void (*orig)(Ctx&), const char* kind, co
   player_redirect(ctx, orig, what);
 }
 
-void hook_player_cap(Ctx& ctx, void (*orig)(Ctx&)) { player_redirect(ctx, orig, "SetMissionCAPEvent"); }
+void hook_player_cap(Ctx& ctx, void (*orig)(Ctx&)) {
+  native_event_gate(ctx, orig, "cap", "SetMissionCAPEvent", true);
+}
 void hook_player_ending(Ctx& ctx, void (*orig)(Ctx&)) {
   native_event_gate(ctx, orig, "end", "SetMissionEndingFlowCAPEvent", true);
 }

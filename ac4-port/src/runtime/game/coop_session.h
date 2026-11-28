@@ -69,4 +69,9 @@ std::string hud_banner();
 // Push local control scheme (TYPE A/B/CUSTOM) to the partner immediately when first read or changed.
 void note_local_keys_changed();
 
+// Automated multi-mission co-op test harness (active only when AC4_COOP_AUTOTEST=1).
+bool autotest_enabled();
+void note_lua_error(const std::string& msg);
+bool autotest_pad_override(uint32_t port, uint16_t* d1, uint16_t* d2, uint8_t* lx, uint8_t* ly, uint8_t* rx, uint8_t* ry);
+
 }  // namespace rt::game::coopsession

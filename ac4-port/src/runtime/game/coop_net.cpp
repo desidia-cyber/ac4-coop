@@ -33,7 +33,7 @@ constexpr uint8_t kTypeTransform = 2;
 constexpr uint8_t kTypeSnapshot = 3;
 constexpr size_t kHeader = 8;
 constexpr size_t kPadLen = kHeader + 19;  // + 6 bytes ACKed reliable rising-edge delivery (edge_seq, edge_buttons, edge_ack)
-constexpr size_t kTransformLen = kHeader + 2 + 4 * (3 + 9 + 3) + 12 + 25 + 24;  // + AP/PA/EN/weapons/ammo + flags
+constexpr size_t kTransformLen = kHeader + 2 + 4 * (3 + 9 + 3) + 12 + 25 + 24 + 8;  // + AP/PA/EN/self_EN/weapons/ammo + flags
 constexpr size_t kMaxDatagram = 1200;  // the largest snapshot datagram (research\26 M2)
 constexpr double kPadTimeout = 1.0;    // seconds without a packet: port 1 goes neutral
 constexpr double kPeerTimeout = 5.0;   // seconds without any packet: link considered down (survives load stalls)
@@ -63,8 +63,9 @@ struct TransformPacket {
   float self_ap, self_apmax;  // sender's own AC1 AP (for partner HUD)
   float peer_pa, peer_pamax;  // sender's AC2 PA (host -> join authoritative PA)
   float self_pa, self_pamax;  // sender's own AC1 PA (for partner HUD)
-  uint8_t flags;              // bit 0: sender local_paused, bit 1: peer_en_redline
+  uint8_t flags;              // bit 0: sender local_paused, bit 1: peer_en_redline, bit 2: self_en_redline
   float peer_en, peer_enmax;  // sender's AC2 EN (host -> join authoritative EN)
+  float self_en, self_enmax;  // sender's own AC1 EN (for accurate partner boost/OB animations on AC2)
   uint8_t peer_wpn_active;    // low nibble: R active idx, high nibble: L active idx (0xf=n/a)
   uint8_t peer_wpn_purged;    // bits 0..5: purged holders on AC2
   uint8_t self_wpn_active;    // sender's own AC1 active weapon nibbles
@@ -81,21 +82,28 @@ struct SnapshotPayload {
 };
 struct SnapshotRecordWire {
   uint16_t ord;
-  uint16_t broken_parts;  // bitmask of destroyed sub-parts (entity+0x2b0 durability vector, up to 16 parts)
+  uint32_t part_state;  // 2 bits per sub-part (up to 16 parts): 0=>50%, 1=<=50%, 2=<=30%, 3=broken
   uint32_t addr;
   uint32_t entity_id;
   float position[3];
   float rotation[9];
   float hp;
+  uint8_t ext_flags;    // bit 0: has_input, bit 1: has_ac
+  uint8_t wpn_active;
+  uint8_t wpn_purged;
+  int8_t in_axes[5];
+  uint32_t in_btn[4];
+  float pitch;
+  float pa;
 };
 #pragma pack(pop)
 static_assert(sizeof(Header) == 8, "8-byte header");
 static_assert(sizeof(PadPacket) == 19, "pad payload");
-static_assert(sizeof(TransformPacket) == 2 + 4 * 15 + 12 + 25 + 24, "transform payload");
+static_assert(sizeof(TransformPacket) == 2 + 4 * 15 + 12 + 25 + 24 + 8, "transform payload");
 static_assert(sizeof(SnapshotPayload) == 12, "snapshot payload header");
-static_assert(sizeof(SnapshotRecordWire) == 64, "snapshot record");
-static_assert(kHeader + sizeof(SnapshotPayload) + 18 * sizeof(SnapshotRecordWire) <= kMaxDatagram,
-              "18 records fit in one datagram");
+static_assert(sizeof(SnapshotRecordWire) == 98, "snapshot record");
+static_assert(kHeader + sizeof(SnapshotPayload) + 12 * sizeof(SnapshotRecordWire) <= kMaxDatagram,
+              "12 records fit in one datagram");
 
 SOCKET g_sock = INVALID_SOCKET;
 bool g_transport_steam = false;
@@ -152,6 +160,8 @@ rt::game::coopnet::WeaponSyncState g_local_peer_wpn{};
 uint8_t g_local_self_wpn_active = 0xff, g_local_self_wpn_purged = 0;
 float g_local_self_ap = 0.0f, g_local_self_apmax = 0.0f;
 float g_local_self_pa = 0.0f, g_local_self_pamax = 0.0f;
+float g_local_self_en = 0.0f, g_local_self_enmax = 0.0f;
+bool g_local_self_en_redline = false;
 std::atomic<float> g_local_pitch{NAN};
 int g_mission_tag = 0;
 double g_last_report = -1e9;
@@ -345,6 +355,9 @@ void process_datagram(const uint8_t* buf, int n) {
       g_xform.peer_en = t.peer_en;
       g_xform.peer_enmax = t.peer_enmax;
       g_xform.peer_en_redline = (t.flags & 2u) != 0;
+      g_xform.self_en = t.self_en;
+      g_xform.self_enmax = t.self_enmax;
+      g_xform.self_en_redline = (t.flags & 4u) != 0;
       g_xform.peer_wpn.active = t.peer_wpn_active;
       g_xform.peer_wpn.purged = t.peer_wpn_purged;
       std::memcpy(g_xform.peer_wpn.ammo, t.peer_ammo, sizeof t.peer_ammo);
@@ -382,10 +395,17 @@ void process_datagram(const uint8_t* buf, int n) {
       r.addr = w.addr;
       r.entity_id = w.entity_id;
       r.ord = w.ord;
-      r.broken_parts = w.broken_parts;
+      r.part_state = w.part_state;
       std::memcpy(r.position, w.position, sizeof r.position);
       std::memcpy(r.rotation, w.rotation, sizeof r.rotation);
       r.hp = w.hp;
+      r.ext_flags = w.ext_flags;
+      r.wpn_active = w.wpn_active;
+      r.wpn_purged = w.wpn_purged;
+      std::memcpy(r.in_axes, w.in_axes, sizeof r.in_axes);
+      std::memcpy(r.in_btn, w.in_btn, sizeof r.in_btn);
+      r.pitch = w.pitch;
+      r.pa = w.pa;
       if (g_snap_in.size() < 8192) g_snap_in.push_back(r);
     }
     g_snap_recv_recs.fetch_add(count, std::memory_order_relaxed);
@@ -550,10 +570,17 @@ size_t send_snapshot(const SnapshotRecord* recs, size_t n, uint32_t tag) {
       w.addr = recs[off + i].addr;
       w.entity_id = recs[off + i].entity_id;
       w.ord = recs[off + i].ord;
-      w.broken_parts = recs[off + i].broken_parts;
+      w.part_state = recs[off + i].part_state;
       std::memcpy(w.position, recs[off + i].position, sizeof w.position);
       std::memcpy(w.rotation, recs[off + i].rotation, sizeof w.rotation);
       w.hp = recs[off + i].hp;
+      w.ext_flags = recs[off + i].ext_flags;
+      w.wpn_active = recs[off + i].wpn_active;
+      w.wpn_purged = recs[off + i].wpn_purged;
+      std::memcpy(w.in_axes, recs[off + i].in_axes, sizeof w.in_axes);
+      std::memcpy(w.in_btn, recs[off + i].in_btn, sizeof w.in_btn);
+      w.pitch = recs[off + i].pitch;
+      w.pa = recs[off + i].pa;
       std::memcpy(payload + sizeof sp + i * sizeof w, &w, sizeof w);
     }
     send_packet(kTypeSnapshot, ++g_snap_seq, payload, sizeof sp + count * sizeof(SnapshotRecordWire));
@@ -641,6 +668,13 @@ void set_local_self_vitals(float ap, float apmax, float pa, float pamax) {
   g_local_self_apmax = apmax;
   g_local_self_pa = pa;
   g_local_self_pamax = pamax;
+}
+
+void set_local_self_en(float en, float enmax, bool redline) {
+  std::lock_guard lk(g_mu);
+  g_local_self_en = en;
+  g_local_self_enmax = enmax;
+  g_local_self_en_redline = redline;
 }
 
 void set_local_self_weapons(uint8_t active, uint8_t purged) {
@@ -865,6 +899,9 @@ void frame(const PadState&) {
       t.peer_en = g_local_peer_en;
       t.peer_enmax = g_local_peer_enmax;
       if (g_local_peer_en_redline) flags |= 2u;
+      t.self_en = g_local_self_en;
+      t.self_enmax = g_local_self_enmax;
+      if (g_local_self_en_redline) flags |= 4u;
       t.peer_wpn_active = g_local_peer_wpn.active;
       t.peer_wpn_purged = g_local_peer_wpn.purged;
       std::memcpy(t.peer_ammo, g_local_peer_wpn.ammo, sizeof t.peer_ammo);

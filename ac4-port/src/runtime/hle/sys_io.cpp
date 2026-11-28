@@ -26,6 +26,7 @@
 #include "runtime/lv2/lv2.h"
 #include "runtime/bindings.h"
 #include "runtime/game/coop_net.h"
+#include "runtime/game/coop_session.h"
 #include "runtime/game/menu_mouse.h"
 #include "runtime/gpu/input_hooks.h"
 #include "runtime/gpu/window.h"
@@ -143,6 +144,7 @@ PadState read_port(u32 port, bool deliver = false) {
     if (k.ly >= 0) s.ly = u8(k.ly);
     if (k.rx >= 0) s.rx = u8(k.rx);
     if (k.ry >= 0) s.ry = u8(k.ry);
+    game::coopsession::autotest_pad_override(port, &s.d1, &s.d2, &s.lx, &s.ly, &s.rx, &s.ry);
   }
   auto pr = [](bool on, u8 cur) { return on ? std::max<u8>(cur, 255) : cur; };
   s.press[0] = pr(s.d1 & RIGHT, s.press[0]);

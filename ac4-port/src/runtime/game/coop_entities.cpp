@@ -501,45 +501,188 @@ struct Target {
   float cur_pos[3] = {};
   float cur_rot[9] = {};
   float hp = 0.0f;
-  uint16_t broken_parts = 0;
+  uint32_t part_state = 0;
   uint16_t queued_parts = 0;
+  uint8_t ext_flags = 0;
+  uint8_t wpn_active = 0xff;
+  uint8_t wpn_purged = 0;
+  uint8_t queued_purges = 0;
+  int8_t in_axes[5] = {};
+  uint32_t in_btn[4] = {};
+  float pitch = 0.0f;
+  float pa = 0.0f;
   double t_prev = 0.0, t_cur = 0.0;
   bool have = false, have_prev = false;
   bool death_queued = false;
   double death_t = -1e9;
 };
+struct SyncedInput {
+  uint32_t btn[4] = {};
+  int8_t axes[5] = {};
+  double at = -1e9;
+};
 std::unordered_map<u32, Target> g_targets;
 std::mutex g_kill_mu;
 std::vector<u32> g_pending_kills;
 std::vector<rt::game::PartBreakJob> g_pending_parts;
+std::unordered_map<u32, float> g_pending_hp;
+std::vector<u32> g_pending_enemy_purges;
+std::mutex g_ent_input_mu;
+std::unordered_map<u32, u32> g_ent_input;           // entity -> InputState*
+std::unordered_set<u32> g_ent_is_ac;                // verified AC/NEXT actors (from hook_ac_turn_input)
+std::unordered_map<u32, SyncedInput> g_synced_in;   // Join: entity -> latest Host InputState
 uint64_t g_kills_queued_total = 0;
 std::mutex g_dead_mu;
 std::unordered_set<u32> g_host_dead;
 uint64_t g_host_dead_logs = 0;
 
+constexpr u32 kAxisOffs[5] = {24u, 28u, 32u, 36u, 48u};
+
+bool read_input_state(u32 state, uint32_t btn[4], int8_t axes[5]) {
+  if (state < 0x10000000u || !rt::vm::committed(state, 52)) return false;
+  for (int i = 0; i < 4; ++i) btn[i] = r32(state + 4u * u32(i));
+  for (int i = 0; i < 5; ++i) {
+    float v = float(ppu::rf32(state + kAxisOffs[i]));
+    if (!std::isfinite(v)) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    if (v < -1.0f) v = -1.0f;
+    axes[i] = int8_t(std::lround(v * 127.0f));
+  }
+  return true;
+}
+
+void write_input_state(u32 state, const uint32_t btn[4], const int8_t axes[5]) {
+  if (state < 0x10000000u || !rt::vm::committed(state, 52)) return;
+  for (int i = 0; i < 4; ++i) ppu::w32(state + 4u * u32(i), btn[i]);
+  for (int i = 0; i < 5; ++i) ppu::wf32(state + kAxisOffs[i], float(axes[i]) / 127.0f);
+}
+
+bool read_enemy_ac_state(u32 entity, float* out_pitch, float* out_pa, uint8_t* out_active, uint8_t* out_purged) {
+  if (entity < 0x10000000u || !rt::vm::committed(entity + 716, 4)) return false;
+  const u32 ac = r32(entity + 708);
+  if (ac < 0x10000000u || !rt::vm::committed(ac + 244, 4)) return false;
+  float pitch = NAN;
+  const u32 look = r32(ac + 240);
+  if (look >= 0x10000000u && rt::vm::committed(look + 52, 4)) {
+    const float p = float(ppu::rf32(look + 48));
+    if (std::isfinite(p) && std::fabs(p) <= 1.6f) pitch = p;
+  }
+  float pa = -1.0f;
+  const u32 pa_obj = r32(entity + 712);
+  if (pa_obj >= 0x10000000u && rt::vm::committed(pa_obj + 824, 4)) {
+    const float cur = float(ppu::rf32(pa_obj + 724));
+    const float base = float(ppu::rf32(pa_obj + 820));
+    if (std::isfinite(cur) && std::isfinite(base) && base > 1.0f) pa = cur;
+  }
+  uint8_t active = 0xff, purged = 0;
+  const u32 wm = r32(ac + 204);
+  if (wm >= 0x10000000u && rt::vm::committed(wm + 1096, 4)) {
+    const s32 r_cnt = s32(r32(wm + 428 + 48)), r_act = s32(r32(wm + 428));
+    const s32 l_cnt = s32(r32(wm + 480 + 48)), l_act = s32(r32(wm + 480));
+    const uint8_t rn = (r_cnt > 0 && r_act >= 0 && r_act < 4) ? uint8_t(r_act) : 0x0fu;
+    const uint8_t ln = (l_cnt > 0 && l_act >= 0 && l_act < 4) ? uint8_t(l_act) : 0x0fu;
+    active = uint8_t(rn | (ln << 4));
+    for (int i = 0; i < 6; ++i) {
+      const u32 h = r32(wm + 1072 + 4u * u32(i));
+      if (h >= 0x10000000u && rt::vm::committed(h + 12, 4) && r32(h + 8) != 0) purged |= uint8_t(1u << i);
+    }
+  }
+  *out_pitch = pitch;
+  *out_pa = pa;
+  *out_active = active;
+  *out_purged = purged;
+  return true;
+}
+
+void apply_enemy_ac_state(u32 entity, Target& t) {
+  if (entity < 0x10000000u || !rt::vm::committed(entity + 716, 4)) return;
+  const u32 ac = r32(entity + 708);
+  if (ac < 0x10000000u || !rt::vm::committed(ac + 244, 4)) return;
+  if (std::isfinite(t.pitch) && std::fabs(t.pitch) <= 1.6f) {
+    const u32 look = r32(ac + 240);
+    if (look >= 0x10000000u && rt::vm::committed(look + 52, 4)) ppu::wf32(look + 48, t.pitch);
+  }
+  if (std::isfinite(t.pa) && t.pa >= 0.0f) {
+    const u32 pa_obj = r32(entity + 712);
+    if (pa_obj >= 0x10000000u && rt::vm::committed(pa_obj + 824, 4)) {
+      const float base = float(ppu::rf32(pa_obj + 820));
+      const float mult = float(ppu::rf32(pa_obj + 776));
+      const float maxv = (std::isfinite(mult) && mult > 0.01f && mult <= 10.0f) ? (base * mult) : base;
+      if (std::isfinite(maxv) && maxv > 1.0f) ppu::wf32(pa_obj + 724, t.pa > maxv ? maxv : t.pa);
+    }
+  }
+  const u32 wm = r32(ac + 204);
+  if (wm < 0x10000000u || !rt::vm::committed(wm + 1096, 4)) return;
+  const u32 banks[2] = {wm + 428u, wm + 480u};
+  for (int b = 0; b < 2; ++b) {
+    const uint8_t want = uint8_t((t.wpn_active >> (b * 4)) & 0x0fu);
+    const s32 cnt = s32(r32(banks[b] + 48));
+    const s32 cur = s32(r32(banks[b]));
+    const s32 tgt = s32(r32(banks[b] + 4));
+    if (want < 4 && s32(want) < cnt && cur != s32(want) && tgt != s32(want)) {
+      ppu::w32(banks[b] + 4, u32(want));
+    }
+  }
+  if (t.wpn_purged) {
+    for (int i = 0; i < 6; ++i) {
+      if (!(t.wpn_purged & (1u << i)) || (t.queued_purges & (1u << i))) continue;
+      const u32 holder = r32(wm + 1072 + 4u * u32(i));
+      if (holder < 0x10000000u || !rt::vm::committed(holder + 12, 4) || r32(holder + 8) != 0) continue;
+      u32 slot_addr = 0;
+      for (int b = 0; b < 2 && !slot_addr; ++b) {
+        const s32 cnt = s32(r32(banks[b] + 48));
+        for (s32 k = 0; k < cnt && k < 2; ++k) {
+          const u32 sp = banks[b] + 8u + 20u * u32(k);
+          if (r32(sp + 12) == holder) { slot_addr = sp; break; }
+        }
+      }
+      if (slot_addr) {
+        t.queued_purges |= uint8_t(1u << i);
+        std::lock_guard lk(g_kill_mu);
+        g_pending_enemy_purges.push_back(slot_addr);
+      }
+    }
+  }
+}
+
 // Reads entity+672+12 sub-part durability vector (f_00b76ecc: begin at +0x2b0, end at +0x2b4,
-// 8 bytes per part: { float cur_hp, float max_hp }). Returns bitmask of parts with cur_hp <= 0.
-uint16_t read_broken_parts(u32 addr) {
+// 8 bytes per part: { float cur_hp, float max_hp }). Encodes 2 bits per part (up to 16 parts):
+//   0 = >50% HP, 1 = <=50% HP, 2 = <=30% HP, 3 = broken (<=0 HP).
+uint32_t read_part_state(u32 addr) {
   if (!rt::vm::committed(addr + 0x2b8, 4)) return 0;
   const u32 beg = r32(addr + 0x2b0);
   const u32 end = r32(addr + 0x2b4);
   if (beg < 0x10000000u || end <= beg || ((end - beg) & 7u) != 0) return 0;
   const u32 cnt = (end - beg) >> 3;
   if (cnt == 0 || cnt > 16 || !rt::vm::committed(beg, end - beg)) return 0;
-  uint16_t mask = 0;
+  uint32_t state = 0;
   for (u32 p = 0; p < cnt; ++p) {
     const float cur = float(ppu::rf32(beg + p * 8u));
     const float maxv = float(ppu::rf32(beg + p * 8u + 4u));
-    if (std::isfinite(maxv) && maxv > 0.0f && std::isfinite(cur) && cur <= 0.0f) mask |= uint16_t(1u << p);
+    if (!std::isfinite(maxv) || maxv <= 0.0f || !std::isfinite(cur)) continue;
+    uint32_t code = 0;
+    if (cur <= 0.0f)
+      code = 3u;
+    else if (cur <= maxv * 0.30f)
+      code = 2u;
+    else if (cur <= maxv * 0.50f)
+      code = 1u;
+    state |= (code << (p * 2u));
   }
-  return mask;
+  return state;
 }
 
 struct SentState {
   float pos[3] = {};
   float rot[9] = {};
   float hp = -1.0f;
-  uint16_t broken_parts = 0;
+  uint32_t part_state = 0;
+  uint8_t ext_flags = 0;
+  uint8_t wpn_active = 0xff;
+  uint8_t wpn_purged = 0;
+  uint32_t in_btn[4] = {};
+  float pitch = 0.0f;
+  float pa = -1.0f;
   uint8_t dead_sends = 0;
   double last_t = -1e9;
 };
@@ -606,17 +749,32 @@ void snapshot_publish() {
       std::lock_guard lk(g_dead_mu);
       if (g_host_dead.count(a) != 0) r.hp = 0.0f;
     }
-    r.broken_parts = read_broken_parts(a);
+    r.part_state = read_part_state(a);
+    r.wpn_active = 0xff;
+    r.pitch = NAN;
+    r.pa = -1.0f;
+    {
+      u32 in_state = 0;
+      bool is_ac = false;
+      {
+        std::lock_guard lk(g_ent_input_mu);
+        auto it_in = g_ent_input.find(a);
+        if (it_in != g_ent_input.end()) in_state = it_in->second;
+        is_ac = (g_ent_is_ac.count(a) != 0);
+      }
+      if (in_state && read_input_state(in_state, r.in_btn, r.in_axes)) r.ext_flags |= 1u;
+      if (is_ac && read_enemy_ac_state(a, &r.pitch, &r.pa, &r.wpn_active, &r.wpn_purged)) r.ext_flags |= 2u;
+    }
 
-    // Bandwidth culling: send immediately when moving, rotating, damaged, sub-part broken, or newly dead (5x);
-    // stationary / long-dead entities refresh at ~1 Hz heartbeat (~70-90% UDP savings).
+    // Bandwidth culling: send immediately when moving, rotating, damaged, sub-part state changed,
+    // firing/boosting/weapon-switching/PA-changing, or newly dead (5x); stationary refresh at ~1 Hz.
     const bool dead = std::isfinite(r.hp) && r.hp <= 0.0f;
     auto it = g_sent.find(a);
     bool send_now = (it == g_sent.end());
     if (!send_now) {
       const SentState& s = it->second;
       if (dead) {
-        send_now = (s.dead_sends < 5) || (r.broken_parts != s.broken_parts) || (now - s.last_t >= 1.0);
+        send_now = (s.dead_sends < 5) || (r.part_state != s.part_state) || (now - s.last_t >= 1.0);
       } else {
         const float dx = r.position[0] - s.pos[0], dy = r.position[1] - s.pos[1], dz = r.position[2] - s.pos[2];
         float dr = 0.0f;
@@ -624,8 +782,15 @@ void snapshot_publish() {
         const bool moved = (dx * dx + dy * dy + dz * dz) > (0.05f * 0.05f);
         const bool turned = dr > 0.005f;
         const bool hp_chg = std::fabs(r.hp - s.hp) > 0.01f;
-        const bool part_chg = (r.broken_parts != s.broken_parts);
-        send_now = moved || turned || hp_chg || part_chg || (now - s.last_t >= 1.0);
+        const bool part_chg = (r.part_state != s.part_state);
+        const bool btn_chg = ((r.ext_flags & 1u) != 0) &&
+                             (r.in_btn[0] != s.in_btn[0] || r.in_btn[1] != s.in_btn[1] ||
+                              r.in_btn[2] != s.in_btn[2] || r.in_btn[3] != s.in_btn[3]);
+        const bool ac_chg = ((r.ext_flags & 2u) != 0) &&
+                            (r.wpn_active != s.wpn_active || r.wpn_purged != s.wpn_purged ||
+                             (std::isfinite(r.pitch) && std::fabs(r.pitch - s.pitch) > 0.05f) ||
+                             (r.pa >= 0.0f && std::fabs(r.pa - s.pa) > 50.0f));
+        send_now = moved || turned || hp_chg || part_chg || btn_chg || ac_chg || (now - s.last_t >= 1.0);
       }
     }
     if (!send_now) continue;
@@ -633,7 +798,13 @@ void snapshot_publish() {
     std::memcpy(s.pos, r.position, sizeof s.pos);
     std::memcpy(s.rot, r.rotation, sizeof s.rot);
     s.hp = r.hp;
-    s.broken_parts = r.broken_parts;
+    s.part_state = r.part_state;
+    s.ext_flags = r.ext_flags;
+    s.wpn_active = r.wpn_active;
+    s.wpn_purged = r.wpn_purged;
+    std::memcpy(s.in_btn, r.in_btn, sizeof s.in_btn);
+    if (std::isfinite(r.pitch)) s.pitch = r.pitch;
+    s.pa = r.pa;
     s.dead_sends = dead ? (s.dead_sends < 250 ? uint8_t(s.dead_sends + 1) : 250) : 0;
     s.last_t = now;
     recs.push_back(r);
@@ -691,7 +862,21 @@ void snapshot_ingest() {
     std::memcpy(t.cur_pos, recs[i].position, sizeof t.cur_pos);
     std::memcpy(t.cur_rot, recs[i].rotation, sizeof t.cur_rot);
     t.hp = recs[i].hp;
-    t.broken_parts = recs[i].broken_parts;
+    t.part_state = recs[i].part_state;
+    t.ext_flags = recs[i].ext_flags;
+    t.wpn_active = recs[i].wpn_active;
+    t.wpn_purged = recs[i].wpn_purged;
+    std::memcpy(t.in_axes, recs[i].in_axes, sizeof t.in_axes);
+    std::memcpy(t.in_btn, recs[i].in_btn, sizeof t.in_btn);
+    t.pitch = recs[i].pitch;
+    t.pa = recs[i].pa;
+    if (recs[i].ext_flags & 1u) {
+      std::lock_guard lk(g_ent_input_mu);
+      SyncedInput& si = g_synced_in[addr];
+      std::memcpy(si.btn, recs[i].in_btn, sizeof si.btn);
+      std::memcpy(si.axes, recs[i].in_axes, sizeof si.axes);
+      si.at = now;
+    }
     t.t_cur = now;
     t.have = true;
     ++g_apply_sec;
@@ -774,19 +959,52 @@ void snapshot_apply() {
     for (int k = 0; k < 3; ++k) {
       ppu::wf32(addr + kEntPos + 4 * k, pos[k]);
       if (have_copy4) ppu::wf32(addr + 0x1c0 + 4 * k, pos[k]);
+      // On large teleports/spawns (>25 u), sync previous position (+0xf0) too so f_004b9eb8
+      // (actor_update) does not compute a bogus single-frame velocity spike and play fall anims.
+      if (std::isfinite(err) && err > 25.0 && rt::vm::committed(addr + 0xf0, 12)) {
+        ppu::wf32(addr + 0xf0 + 4 * k, pos[k]);
+      }
     }
+    const float prev_local_hp = float(ppu::rf32(addr + kEntHp));
     ppu::wf32(addr + kEntHp, t.hp);
-    // Multi-part boss/ship sub-part destruction sync (entity+0x2b0 durability array):
-    // when Host breaks sub-part p and Joiner's part p is still intact, queue native f_00a5091c.
-    if (t.broken_parts) {
-      const uint16_t local_broken = read_broken_parts(addr);
-      const uint16_t missing = uint16_t(t.broken_parts & ~local_broken & ~t.queued_parts);
-      if (missing) {
-        std::lock_guard lk(g_kill_mu);
-        for (int p = 0; p < 16; ++p) {
-          if (missing & (1u << p)) {
+    if (std::isfinite(prev_local_hp) && std::isfinite(t.hp) && t.hp > 0.0f &&
+        std::fabs(prev_local_hp - t.hp) > 0.5f) {
+      std::lock_guard lk(g_kill_mu);
+      g_pending_hp[addr] = t.hp;
+    }
+    // Tier 1 & Tier 2: re-assert Host enemy InputState and enemy NEXT pitch/PA/weapons every frame.
+    if (t.ext_flags & 3u) {
+      u32 in_state = 0;
+      bool is_ac = false;
+      {
+        std::lock_guard lk(g_ent_input_mu);
+        auto it_in = g_ent_input.find(addr);
+        if (it_in != g_ent_input.end()) in_state = it_in->second;
+        is_ac = (g_ent_is_ac.count(addr) != 0);
+      }
+      if ((t.ext_flags & 1u) && in_state) write_input_state(in_state, t.in_btn, t.in_axes);
+      if ((t.ext_flags & 2u) && is_ac) apply_enemy_ac_state(addr, t);
+    }
+    // Multi-part boss/ship sub-part durability & destruction sync (entity+0x2b0 durability array):
+    // 2 bits per part: 1=<=50%, 2=<=30%, 3=broken (queues native f_00a5091c break VFX & disable).
+    if (t.part_state) {
+      const uint32_t local_state = read_part_state(addr);
+      if (local_state != t.part_state && rt::vm::committed(addr + 0x2b8, 4)) {
+        const u32 beg = r32(addr + 0x2b0), end = r32(addr + 0x2b4);
+        const u32 cnt = (beg >= 0x10000000u && end > beg && ((end - beg) & 7u) == 0) ? ((end - beg) >> 3) : 0;
+        const bool have_arr = cnt > 0 && cnt <= 16 && rt::vm::committed(beg, end - beg);
+        for (u32 p = 0; p < cnt && p < 16; ++p) {
+          const uint32_t hc = (t.part_state >> (p * 2u)) & 3u;
+          const uint32_t lc = (local_state >> (p * 2u)) & 3u;
+          if (hc == 3u && lc != 3u && !(t.queued_parts & (1u << p))) {
+            std::lock_guard lk(g_kill_mu);
             t.queued_parts |= uint16_t(1u << p);
             g_pending_parts.push_back({addr, s32(p), t.hp});
+          } else if (have_arr && (hc == 1u || hc == 2u) && lc < hc) {
+            const float maxv = float(ppu::rf32(beg + p * 8u + 4u));
+            if (std::isfinite(maxv) && maxv > 0.0f) {
+              ppu::wf32(beg + p * 8u, maxv * (hc == 2u ? 0.29f : 0.49f));
+            }
           }
         }
       }
@@ -795,10 +1013,16 @@ void snapshot_apply() {
   if (now - g_last_snap_log < 1.0) return;
   g_last_snap_log = now;
   const double mean_err = g_err_n_sec ? g_err_sum_sec / double(g_err_n_sec) : 0.0;
-  LOG_I("coop", "COOP SNAP join t=%.1f applied %llu rec (total %llu), skipped %llu, counter %u, host lowest 0x%08x vs local 0x%08x, pre-apply error mean %.2f max %.2f at 0x%08x, %zu live target(s), kills_q=%llu%s",
+  size_t n_in = 0, n_ac = 0;
+  {
+    std::lock_guard lk(g_ent_input_mu);
+    n_in = g_ent_input.size();
+    n_ac = g_ent_is_ac.size();
+  }
+  LOG_I("coop", "COOP SNAP join t=%.1f applied %llu rec (total %llu), skipped %llu, counter %u, host lowest 0x%08x vs local 0x%08x, pre-apply error mean %.2f max %.2f at 0x%08x, %zu live target(s), kills_q=%llu, in=%zu ac=%zu%s",
         now, (unsigned long long)g_apply_sec, (unsigned long long)g_apply_total, (unsigned long long)g_skip_sec,
         g_seen_counter, rt::game::coopnet::snapshot_tag(), g_ent_lowest, mean_err, g_maxerr_sec, g_worst_addr_sec,
-        g_targets.size(), (unsigned long long)g_kills_queued_total,
+        g_targets.size(), (unsigned long long)g_kills_queued_total, n_in, n_ac,
         g_nosnap.load() ? " [AC4_COOP_NOSNAP=1: received, NOT applied]" : "");
   g_apply_sec = g_skip_sec = 0;
   g_maxerr_sec = 0;
@@ -840,6 +1064,14 @@ void do_reset() {
     std::lock_guard lk(g_kill_mu);
     g_pending_kills.clear();
     g_pending_parts.clear();
+    g_pending_hp.clear();
+    g_pending_enemy_purges.clear();
+  }
+  {
+    std::lock_guard lk(g_ent_input_mu);
+    g_ent_input.clear();
+    g_ent_is_ac.clear();
+    g_synced_in.clear();
   }
   {
     std::lock_guard lk(g_dead_mu);
@@ -889,6 +1121,54 @@ size_t coop_entities_drain_part_breaks(PartBreakJob* out, size_t max) {
   const size_t n = g_pending_parts.size() < max ? g_pending_parts.size() : max;
   for (size_t i = 0; i < n; ++i) out[i] = g_pending_parts[i];
   g_pending_parts.erase(g_pending_parts.begin(), g_pending_parts.begin() + std::ptrdiff_t(n));
+  return n;
+}
+
+size_t coop_entities_drain_hp_sync(HpSyncJob* out, size_t max) {
+  if (!out || !max) return 0;
+  std::lock_guard lk(g_kill_mu);
+  size_t n = 0;
+  for (auto it = g_pending_hp.begin(); it != g_pending_hp.end() && n < max;) {
+    out[n++] = {it->first, it->second};
+    it = g_pending_hp.erase(it);
+  }
+  return n;
+}
+
+void coop_entities_note_input_state(u32 entity, u32 state, bool is_ac) {
+  if (entity < kEntAddrFloor || state < kEntAddrFloor) return;
+  const u32 b1 = rt::game::coop_body(1), b2 = rt::game::coop_body(2);
+  if (entity == b1 || entity == b2) return;
+  if (!rt::vm::committed(entity, 8) || r32(entity) != kActorVt) return;
+  const u32 eid = r32(entity + kEntId);
+  if (eid == 1000u || eid == 1001u) return;
+  std::lock_guard lk(g_ent_input_mu);
+  g_ent_input[entity] = state;
+  if (is_ac) g_ent_is_ac.insert(entity);
+}
+
+bool coop_entities_apply_input_state(u32 entity, u32 state) {
+  if (entity < kEntAddrFloor || state < kEntAddrFloor) return false;
+  if (!rt::game::coopnet::role_join() || !rt::game::coopsession::linked_in_mission()) return false;
+  uint32_t btn[4];
+  int8_t axes[5];
+  {
+    std::lock_guard lk(g_ent_input_mu);
+    auto it = g_synced_in.find(entity);
+    if (it == g_synced_in.end() || (rt::log_time() - it->second.at) > 1.5) return false;
+    std::memcpy(btn, it->second.btn, sizeof btn);
+    std::memcpy(axes, it->second.axes, sizeof axes);
+  }
+  write_input_state(state, btn, axes);
+  return true;
+}
+
+size_t coop_entities_drain_enemy_purges(u32* out_slots, size_t max) {
+  if (!out_slots || !max) return 0;
+  std::lock_guard lk(g_kill_mu);
+  const size_t n = g_pending_enemy_purges.size() < max ? g_pending_enemy_purges.size() : max;
+  for (size_t i = 0; i < n; ++i) out_slots[i] = g_pending_enemy_purges[i];
+  g_pending_enemy_purges.erase(g_pending_enemy_purges.begin(), g_pending_enemy_purges.begin() + std::ptrdiff_t(n));
   return n;
 }
 

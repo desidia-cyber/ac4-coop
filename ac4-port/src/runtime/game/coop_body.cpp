@@ -599,13 +599,16 @@ void net_frame() {
     }
   }
 
-  // Publish this instance's OWN AC1 AP, PA & active/purged weapons (for Partner HUD & visual AC2 sync).
+  // Publish this instance's OWN AC1 AP, PA, EN & active/purged weapons (for Partner HUD & visual AC2 sync).
   if (b1 && rt::vm::committed(b1 + kBodyApMax, 4)) {
     const float ap1 = float(ppu::rf32(b1 + kBodyAp));
     const float apm1 = float(ppu::rf32(b1 + kBodyApMax));
     float pa1 = 0.0f, pam1 = 0.0f;
     read_body_pa(b1, &pa1, &pam1);
     rt::game::coopnet::set_local_self_vitals(ap1, apm1, pa1, pam1);
+    float en1 = 0.0f, enm1 = 0.0f;
+    bool en1_red = false;
+    if (read_body_en(b1, &en1, &enm1, &en1_red)) rt::game::coopnet::set_local_self_en(en1, enm1, en1_red);
     rt::game::coopnet::WeaponSyncState w1{};
     if (read_body_weapons(b1, &w1)) rt::game::coopnet::set_local_self_weapons(w1.active, w1.purged);
   }
@@ -669,7 +672,21 @@ void net_frame() {
     write_body_hud_ammo(b1, t.peer_wpn.ammo);
     reconcile_body_weapons(1, b1, t.peer_wpn.active, t.peer_wpn.purged);
   }
-  if (b2) reconcile_body_weapons(2, b2, t.self_wpn_active, t.self_wpn_purged);
+  if (b2) {
+    reconcile_body_weapons(2, b2, t.self_wpn_active, t.self_wpn_purged);
+    // On the Joiner, keep Host's AC (body2) EN/redline & PA aura synced to Host's AC1 so Host's
+    // boost/OB/flight animations and Primal Armor VFX never diverge locally.
+    if (rt::game::coopnet::role_join()) {
+      if (t.self_enmax > 10.0f && std::isfinite(t.self_en)) write_body_en(b2, t.self_en, t.self_en_redline);
+      if (t.self_pamax > 1.0f && std::isfinite(t.self_pa) && t.self_pa >= 0.0f && t.self_pa <= t.self_pamax * 1.5f) {
+        const u32 pa2 = body_pa_obj(b2);
+        float c2 = 0.0f, m2 = 0.0f;
+        if (pa2 && read_body_pa(b2, &c2, &m2)) {
+          ppu::wf32(pa2 + kPaObjCur, t.self_pa > m2 ? m2 : t.self_pa);
+        }
+      }
+    }
+  }
   if (!b2 || !g_pos.any) return;
   if (!rt::vm::committed(b2 + 0x1c0, 16)) return;
   if (!pos_valid(t.position) || (t.position[0] * t.position[0] + t.position[1] * t.position[1] + t.position[2] * t.position[2] < 1.0f))

@@ -34,6 +34,7 @@
 void f_00a4ece4(ppu::Ctx&);  // Actor::OnEvent(entity, type, id, arg, flag), TOC = 0x00ef5c94
 void f_00a5091c(ppu::Ctx&);  // Actor::ApplyDamage(entity, DamageMsg*, flag), TOC = 0x00ef5c94
 void f_00a50cb8(ppu::Ctx&);  // Actor::ApplyDirectDamage(entity, float damage), TOC = 0x00ef5c94
+void f_00a53900_guest(ppu::Ctx&);  // Actor::SetHp(entity, float hp) + durability/gauge notify, TOC = 0x00ef5c94
 void f_00a29aac(ppu::Ctx&);  // WeaponSlot::Purge(slot), TOC = 0x00ef5c94
 
 namespace {
@@ -218,6 +219,23 @@ void drain_ppu_coop_jobs(Ctx& ctx) {
       LOG_I("coop", "COOP PART: native break 0x%08x (id=%u) part[%d] %.1f -> %.1f", tgt, r32(tgt + 4), pid,
             double(pcur), double(rf32(beg + u32(pid) * 8u)));
     }
+    rt::game::HpSyncJob hps[16];
+    const size_t nhp = rt::game::coop_entities_drain_hp_sync(hps, 16);
+    for (size_t i = 0; i < nhp; ++i) {
+      const u32 tgt = hps[i].addr;
+      if (tgt < 0x10000000u || tgt == b1 || tgt == b2 || !rt::vm::committed(tgt + 0x2a8, 4)) continue;
+      if (r32(tgt) != 0x10142638u) continue;
+      const u32 eid = r32(tgt + 4);
+      if (eid == 1000u || eid == 1001u) continue;
+      if (!std::isfinite(hps[i].hp) || hps[i].hp <= 0.0f) continue;
+      const Ctx saved = ctx;
+      ctx.r[1] = saved.r[1] - 128u;
+      ctx.r[2] = kGameToc;
+      ctx.r[3] = tgt;
+      ctx.f[1] = double(hps[i].hp);
+      f_00a53900_guest(ctx);
+      ctx = saved;
+    }
   }
   u32 purges[4];
   const size_t np = rt::game::coop_body_drain_purges(purges, 4);
@@ -231,6 +249,21 @@ void drain_ppu_coop_jobs(Ctx& ctx) {
     f_00a29aac(ctx);
     ctx = saved;
     LOG_I("coop", "COOP WPN: executed native purge on slot 0x%08x", slot);
+  }
+  if (rt::game::coopnet::role_join()) {
+    u32 epurges[4];
+    const size_t nep = rt::game::coop_entities_drain_enemy_purges(epurges, 4);
+    for (size_t i = 0; i < nep; ++i) {
+      const u32 slot = epurges[i];
+      if (slot < 0x10000000u || !rt::vm::committed(slot, 20)) continue;
+      const Ctx saved = ctx;
+      ctx.r[1] = saved.r[1] - 128u;
+      ctx.r[2] = kGameToc;
+      ctx.r[3] = slot;
+      f_00a29aac(ctx);
+      ctx = saved;
+      LOG_I("coop", "COOP WPN: executed native enemy NEXT purge on slot 0x%08x", slot);
+    }
   }
   in_ppu_jobs = false;
 }
